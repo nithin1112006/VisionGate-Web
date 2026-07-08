@@ -47,7 +47,7 @@ class AttendanceForegroundService : Service() {
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
 
-    private var baseUrl: String = "https://attenda.srishakthicgpa.in"
+    private var baseUrl: String = "https://app.srishakthicgpa.in"
     private var geofenceLat: Double = 11.0396
     private var geofenceLng: Double = 77.0747
     private var geofenceRadius: Float = 250f

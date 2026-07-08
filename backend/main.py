@@ -3362,13 +3362,19 @@ def is_user_suspended(username: str, is_other_staff: bool = False) -> bool:
 
 def get_user_by_username(username: str):
     """Get user by username"""
-    cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+    cursor.execute(
+        "SELECT id, username, password_hash, reg_no, name, dept, role, is_active, face_embedding, current_device_id, out_permission_enabled, out_permission_expiry, created_by, created_at, updated_at, embedding, can_reregister, suspended FROM users WHERE username = ?",
+        (username,),
+    )
     return cursor.fetchone()
 
 
 def get_user_by_reg_no(reg_no: str):
     """Get user by registration number (case-insensitive)"""
-    cursor.execute("SELECT * FROM users WHERE LOWER(reg_no) = LOWER(?)", (reg_no,))
+    cursor.execute(
+        "SELECT id, username, password_hash, reg_no, name, dept, role, is_active, face_embedding, current_device_id, out_permission_enabled, out_permission_expiry, created_by, created_at, updated_at, embedding, can_reregister, suspended FROM users WHERE LOWER(reg_no) = LOWER(?)",
+        (reg_no,),
+    )
     return cursor.fetchone()
 
 
@@ -3384,28 +3390,36 @@ def delete_user_data_by_reg_no(reg_no: str):
     cursor.execute("""
         DELETE FROM admin_notifications 
         WHERE notification_type = 'leave_request' AND related_id IN (
-            SELECT id FROM leave_requests WHERE user_reg_no = ?
+            SELECT CAST(id AS varchar) FROM leave_requests WHERE user_reg_no = ?
         )
     """, (reg_no,))
 
-    # Now delete primary records
-    cursor.execute("DELETE FROM attendance WHERE reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM daily_attendance_status WHERE reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM face_embedding_samples WHERE reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM casual_leave WHERE reg_no = ?", (reg_no,))
-    # cursor.execute("DELETE FROM user_location_logs WHERE reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM user_latest_locations WHERE reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM other_staff_attendance WHERE reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM leave_requests WHERE user_reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM face_reregister_requests WHERE staff_reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM user_locations WHERE reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM attendance_locations WHERE reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM geofence_breach_monitoring WHERE reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM students WHERE reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM earned_leave WHERE reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM ccl_earned_history WHERE reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM users WHERE reg_no = ?", (reg_no,))
-    cursor.execute("DELETE FROM other_staff WHERE reg_no = ?", (reg_no,))
+    # Now delete primary records safely
+    tables_to_delete = [
+        ("attendance", "reg_no"),
+        ("daily_attendance_status", "reg_no"),
+        ("face_embedding_samples", "reg_no"),
+        ("casual_leave", "reg_no"),
+        ("user_location_logs", "reg_no"),
+        ("user_latest_locations", "reg_no"),
+        ("other_staff_attendance", "reg_no"),
+        ("leave_requests", "user_reg_no"),
+        ("face_reregister_requests", "staff_reg_no"),
+        ("user_locations", "reg_no"),
+        ("attendance_locations", "reg_no"),
+        ("geofence_breach_monitoring", "reg_no"),
+        ("students", "reg_no"),
+        ("earned_leave", "reg_no"),
+        ("ccl_earned_history", "reg_no"),
+        ("users", "reg_no"),
+        ("other_staff", "reg_no"),
+    ]
+    
+    for table, col in tables_to_delete:
+        try:
+            cursor.execute(f"DELETE FROM {table} WHERE {col} = ?", (reg_no,))
+        except Exception as e:
+            print(f"[SAFE DELETE] Table {table} delete skipped/failed: {e}")
 
 
 # -------------------------------------------------
@@ -5777,7 +5791,7 @@ async def update_user_out_permission(request: Request):
     try:
         body = await request.json()
         reg_no = body.get("reg_no")
-        enabled = int(body.get("enabled", False))
+        enabled = bool(body.get("enabled", False))
         expires_at = body.get("expires_at")
 
         if not reg_no:
@@ -10615,7 +10629,10 @@ async def admin_update_user(request: Request, user_id: int):
         raise HTTPException(status_code=400, detail="Invalid role")
 
     try:
-        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        cursor.execute(
+            "SELECT id, username, password_hash, reg_no, name, dept, role, is_active, face_embedding, current_device_id, out_permission_enabled, out_permission_expiry, created_by, created_at, updated_at, embedding, can_reregister, suspended FROM users WHERE id = ?",
+            (user_id,),
+        )
         existing = cursor.fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="User not found")
@@ -10647,7 +10664,7 @@ async def admin_update_user(request: Request, user_id: int):
             params.append(hash_password(password))
         if suspended is not None:
             updates.append("suspended = ?")
-            params.append(suspended)
+            params.append(bool(suspended))
 
         if not updates:
             return {"message": "No changes to update"}
@@ -10680,7 +10697,10 @@ async def admin_delete_user(request: Request, user_id: int):
     admin_user = verify_admin_token(request)
 
     try:
-        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        cursor.execute(
+            "SELECT id, username, password_hash, reg_no, name, dept, role, is_active, face_embedding, current_device_id, out_permission_enabled, out_permission_expiry, created_by, created_at, updated_at, embedding, can_reregister, suspended FROM users WHERE id = ?",
+            (user_id,),
+        )
         existing = cursor.fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="User not found")
@@ -10910,7 +10930,7 @@ async def admin_update_other_staff(request: Request, staff_id: int):
             dept = default_dept
         elif isinstance(dept, str):
             dept = dept.strip()
-        can_reregister = data.get("can_reregister", 0)
+        can_reregister = bool(data.get("can_reregister", False))
 
         # Validate role
         if role not in OTHER_STAFF_ROLES:
@@ -10958,7 +10978,7 @@ async def admin_update_other_staff(request: Request, staff_id: int):
         # Get existing suspended status
         cursor.execute("SELECT COALESCE(suspended, FALSE) FROM other_staff WHERE id = ?", (staff_id,))
         existing_suspended = cursor.fetchone()[0]
-        suspended = data.get("suspended", existing_suspended)
+        suspended = bool(data.get("suspended", existing_suspended))
 
         cursor.execute(
             """
@@ -13424,7 +13444,7 @@ async def hod_delete_staff(request: Request, staff_id: int):
 
     try:
         cursor.execute(
-            "SELECT * FROM users WHERE id = ? AND dept = ? AND role = 'staff'",
+            "SELECT id, username, password_hash, reg_no, name, dept, role, is_active, face_embedding, current_device_id, out_permission_enabled, out_permission_expiry, created_by, created_at, updated_at, embedding, can_reregister, suspended FROM users WHERE id = ? AND dept = ? AND role = 'staff'",
             (staff_id, dept),
         )
         existing = cursor.fetchone()
@@ -13532,7 +13552,7 @@ async def hod_update_staff(request: Request, staff_id: int):
 
         # Verify staff exists in HOD's department
         cursor.execute(
-            "SELECT * FROM users WHERE id = ? AND dept = ? AND role = 'staff'",
+            "SELECT id, username, password_hash, reg_no, name, dept, role, is_active, face_embedding, current_device_id, out_permission_enabled, out_permission_expiry, created_by, created_at, updated_at, embedding, can_reregister, suspended FROM users WHERE id = ? AND dept = ? AND role = 'staff'",
             (staff_id, dept),
         )
         existing = cursor.fetchone()

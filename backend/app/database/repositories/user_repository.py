@@ -5,6 +5,7 @@ from typing import Optional, List
 import asyncpg
 from ..connection import db_pool
 from ..models import User, OtherStaff
+from .base_repository import BaseRepository
 
 logger = logging.getLogger(__name__)
 

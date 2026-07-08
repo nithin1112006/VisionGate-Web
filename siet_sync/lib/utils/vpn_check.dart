@@ -26,6 +26,8 @@ class VpnChecker {
         return await _detectVpnIos();
       } else if (Platform.isWindows) {
         return await _detectVpnWindows();
+      } else if (Platform.isLinux) {
+        return await _detectVpnLinux();
       }
       
       // Unknown platform - block by default (fail secure)
@@ -34,6 +36,25 @@ class VpnChecker {
       print('[VPN] Detection error: $e');
       // Fail-closed: if any error occurs, assume VPN is active for security
       return true;
+    }
+  }
+
+  /// Linux VPN detection
+  static Future<bool> _detectVpnLinux() async {
+    try {
+      for (final interface in await NetworkInterface.list()) {
+        final name = interface.name.toLowerCase();
+        if (name.contains('vpn') || 
+            name.contains('wireguard') || 
+            name.contains('openvpn') ||
+            name.contains('tun') ||
+            name.contains('tap')) {
+          return true;
+        }
+      }
+      return false;
+    } catch (e) {
+      return false;
     }
   }
 

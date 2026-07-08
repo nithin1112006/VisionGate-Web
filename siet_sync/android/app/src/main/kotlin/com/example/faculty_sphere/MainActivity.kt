@@ -14,7 +14,7 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "startService" -> {
-                    val baseUrl = call.argument<String>("baseUrl") ?: "https://attenda.srishakthicgpa.in"
+                    val baseUrl = call.argument<String>("baseUrl") ?: "https://app.srishakthicgpa.in"
                     val lat = call.argument<Double>("geofenceLat") ?: 11.0396
                     val lng = call.argument<Double>("geofenceLng") ?: 77.0747
                     val radius = call.argument<Double>("geofenceRadius")?.toFloat() ?: 250f

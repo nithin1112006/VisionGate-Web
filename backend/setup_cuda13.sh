@@ -7,12 +7,15 @@ pip uninstall -y torch torchvision torchaudio onnxruntime onnxruntime-gpu
 
 echo "=== Installing PyTorch for CUDA 13.0 ==="
 # Installs PyTorch built against CUDA 13.0
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 
 echo "=== Installing ONNX Runtime GPU (CUDA 13 Nightly) ==="
 # Installs ONNX Runtime GPU built against CUDA 13
 pip install coloredlogs flatbuffers numpy packaging protobuf sympy
-pip install --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu
+pip install --no-cache-dir --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu
+
+echo "=== Ensuring compatible numpy 1.x is installed ==="
+pip install "numpy<2.0.0"
 
 echo "=== Verifying CUDA & GPU support ==="
 python3 -c "

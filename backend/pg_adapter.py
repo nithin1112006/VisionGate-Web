@@ -50,6 +50,8 @@ class _ThreadLocalCursor:
 
     def execute(self, sql, params=None):
         conn, cur = self._get_conn()
+        sql = sql.replace("can_reregister = 1", "can_reregister = TRUE")
+        sql = sql.replace("can_reregister = 0", "can_reregister = FALSE")
         sql = sql.replace("?", "%s")
         if params is not None:
             cur.execute(sql, params)

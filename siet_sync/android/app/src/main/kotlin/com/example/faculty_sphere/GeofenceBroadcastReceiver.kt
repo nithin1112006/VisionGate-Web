@@ -133,7 +133,7 @@ class GeofenceBroadcastReceiver : BroadcastReceiver() {
     private suspend fun sendTransitionToBackend(context: Context, transition: String, location: android.location.Location) {
         try {
             val nativePrefs = context.getSharedPreferences("AttendanceNativePrefs", Context.MODE_PRIVATE)
-            val baseUrl = nativePrefs.getString("baseUrl", "https://attenda.srishakthicgpa.in") ?: return
+            val baseUrl = nativePrefs.getString("baseUrl", "https://app.srishakthicgpa.in") ?: return
 
             val flutterPrefs = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
             val sessionStr = flutterPrefs.getString("flutter.user_session", null) ?: return
