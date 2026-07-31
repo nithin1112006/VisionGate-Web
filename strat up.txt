@@ -10,3 +10,5 @@ cloudflared tunnel run attenda-tunnel
 sudo systemctl start postgresql
 # or
 sudo service postgresql start
+
+cd /var/www/attenda/siet_sync && flutter build web --release
