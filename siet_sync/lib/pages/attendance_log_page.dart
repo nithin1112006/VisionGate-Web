@@ -396,10 +396,40 @@ class _AttendanceLogTabState extends State<AttendanceLogTab> {
                               statusColor = Colors.red;
                               statusIcon = Icons.cancel_rounded;
                               displayStatus = 'Absent';
-                            } else if (status == 'Present' && source == 'od') {
-                              statusColor = Colors.indigo;
-                              statusIcon = Icons.star_rounded;
-                              displayStatus = 'On Duty';
+                            } else if (status == 'Half Day') {
+                              statusColor = Colors.orange;
+                              statusIcon = Icons.timelapse_rounded;
+                              if (log['first_half_status'] == 'Present' && log['second_half_status'] == 'Present') {
+                                displayStatus = 'Present (FN & AN Present)';
+                                statusColor = Colors.green;
+                                statusIcon = Icons.check_circle_rounded;
+                              } else if (log['first_half_status'] == 'Present') {
+                                final anStatus = log['second_half_status'] ?? 'Pending';
+                                displayStatus = '0.5 (FN Present • AN $anStatus)';
+                              } else if (log['second_half_status'] == 'Present') {
+                                final fnStatus = log['first_half_status'] ?? 'Pending';
+                                displayStatus = '0.5 (AN Present • FN $fnStatus)';
+                              } else {
+                                displayStatus = '0.5 (Half Day)';
+                              }
+                            } else if (status == 'Present' || status == 'check_in') {
+                              statusColor = Colors.green;
+                              statusIcon = Icons.check_circle_rounded;
+                              if (source == 'od') {
+                                statusColor = Colors.indigo;
+                                statusIcon = Icons.star_rounded;
+                                displayStatus = 'On Duty';
+                              } else if (log['first_half_status'] == 'Present' && log['second_half_status'] == 'Present') {
+                                displayStatus = 'Present (FN & AN Present)';
+                              } else if (log['first_half_status'] == 'Present') {
+                                final anStatus = log['second_half_status'] ?? 'Pending';
+                                displayStatus = 'Present (FN Present • AN $anStatus)';
+                              } else if (log['second_half_status'] == 'Present') {
+                                final fnStatus = log['first_half_status'] ?? 'Pending';
+                                displayStatus = 'Present (AN Present • FN $fnStatus)';
+                              } else {
+                                displayStatus = 'Present';
+                              }
                             } else if (status == 'Holiday') {
                               statusColor = Colors.orange;
                               statusIcon = Icons.celebration_rounded;
@@ -486,7 +516,7 @@ class _AttendanceLogTabState extends State<AttendanceLogTab> {
                                           ),
                                         ],
                                       ),
-                                      if (source == 'face_scan')
+                                      if (source == 'face_scan') ...[
                                         Container(
                                           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                                           decoration: BoxDecoration(
@@ -502,8 +532,184 @@ class _AttendanceLogTabState extends State<AttendanceLogTab> {
                                             ),
                                           ),
                                         ),
+                                        const SizedBox(width: 6),
+                                        Builder(builder: (context) {
+                                          final rawPunch = log['punch_type'] as String? ?? 'check_in';
+                                          final isOut = rawPunch == 'check_out';
+                                          return Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                            decoration: BoxDecoration(
+                                              color: (isOut ? Colors.orange : Colors.teal).withValues(alpha: 0.1),
+                                              borderRadius: BorderRadius.circular(8),
+                                            ),
+                                            child: Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                Icon(
+                                                  isOut ? Icons.logout : Icons.login,
+                                                  size: 10,
+                                                  color: isOut ? Colors.orange : Colors.teal,
+                                                ),
+                                                const SizedBox(width: 3),
+                                                Text(
+                                                  isOut ? 'Check Out' : 'Check In',
+                                                  style: TextStyle(
+                                                    color: isOut ? Colors.orange : Colors.teal,
+                                                    fontSize: 10,
+                                                    fontWeight: FontWeight.bold,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          );
+                                        }),
+                                      ],
                                     ],
                                   ),
+
+                                  // Session Split Summary
+                                  if (log['first_half_status'] != null || log['second_half_status'] != null) ...[
+                                    const SizedBox(height: 12),
+                                    Row(
+                                      children: [
+                                        Expanded(
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+                                            decoration: BoxDecoration(
+                                              color: isDark ? Colors.white.withValues(alpha: 0.03) : Colors.grey.shade50,
+                                              borderRadius: BorderRadius.circular(10),
+                                              border: Border.all(color: isDark ? Colors.white12 : Colors.grey.shade200),
+                                            ),
+                                            child: Column(
+                                              crossAxisAlignment: CrossAxisAlignment.start,
+                                              children: [
+                                                Text(
+                                                  'FN (Morning)',
+                                                  style: TextStyle(
+                                                    fontSize: 11,
+                                                    color: isDark ? Colors.white60 : Colors.grey[600],
+                                                    fontWeight: FontWeight.bold,
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 4),
+                                                Row(
+                                                  children: [
+                                                    Icon(
+                                                      log['first_half_status'] == 'Present'
+                                                          ? Icons.check_circle_outline
+                                                          : (log['first_half_status'] == 'Leave'
+                                                              ? Icons.beach_access
+                                                              : (log['first_half_status'] == 'Absent'
+                                                                  ? Icons.cancel_outlined
+                                                                  : Icons.access_time_rounded)),
+                                                      size: 14,
+                                                      color: log['first_half_status'] == 'Present'
+                                                          ? Colors.green
+                                                          : (log['first_half_status'] == 'Leave'
+                                                              ? Colors.blue
+                                                              : (log['first_half_status'] == 'Absent'
+                                                                  ? Colors.redAccent
+                                                                  : Colors.orange)),
+                                                    ),
+                                                    const SizedBox(width: 4),
+                                                    Text(
+                                                      log['first_half_status'] ?? 'Pending',
+                                                      style: TextStyle(
+                                                        fontSize: 13,
+                                                        fontWeight: FontWeight.w600,
+                                                        color: log['first_half_status'] == 'Present'
+                                                            ? Colors.green
+                                                            : (log['first_half_status'] == 'Leave'
+                                                                ? Colors.blue
+                                                                : (log['first_half_status'] == 'Absent'
+                                                                    ? Colors.redAccent
+                                                                    : Colors.orange)),
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                                if (log['first_half_in_time'] != null) ...[
+                                                  const SizedBox(height: 2),
+                                                  Text(
+                                                    'In: ${log['first_half_in_time']}',
+                                                    style: const TextStyle(fontSize: 11, color: Colors.grey),
+                                                  ),
+                                                ],
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 12),
+                                        Expanded(
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+                                            decoration: BoxDecoration(
+                                              color: isDark ? Colors.white.withValues(alpha: 0.03) : Colors.grey.shade50,
+                                              borderRadius: BorderRadius.circular(10),
+                                              border: Border.all(color: isDark ? Colors.white12 : Colors.grey.shade200),
+                                            ),
+                                            child: Column(
+                                              crossAxisAlignment: CrossAxisAlignment.start,
+                                              children: [
+                                                Text(
+                                                  'AN (Evening)',
+                                                  style: TextStyle(
+                                                    fontSize: 11,
+                                                    color: isDark ? Colors.white60 : Colors.grey[600],
+                                                    fontWeight: FontWeight.bold,
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 4),
+                                                Row(
+                                                  children: [
+                                                    Icon(
+                                                      log['second_half_status'] == 'Present'
+                                                          ? Icons.check_circle_outline
+                                                          : (log['second_half_status'] == 'Leave'
+                                                              ? Icons.beach_access
+                                                              : (log['second_half_status'] == 'Absent'
+                                                                  ? Icons.cancel_outlined
+                                                                  : Icons.access_time_rounded)),
+                                                      size: 14,
+                                                      color: log['second_half_status'] == 'Present'
+                                                          ? Colors.green
+                                                          : (log['second_half_status'] == 'Leave'
+                                                              ? Colors.blue
+                                                              : (log['second_half_status'] == 'Absent'
+                                                                  ? Colors.redAccent
+                                                                  : Colors.orange)),
+                                                    ),
+                                                    const SizedBox(width: 4),
+                                                    Text(
+                                                      log['second_half_status'] ?? 'Pending',
+                                                      style: TextStyle(
+                                                        fontSize: 13,
+                                                        fontWeight: FontWeight.w600,
+                                                        color: log['second_half_status'] == 'Present'
+                                                            ? Colors.green
+                                                            : (log['second_half_status'] == 'Leave'
+                                                                ? Colors.blue
+                                                                : (log['second_half_status'] == 'Absent'
+                                                                    ? Colors.redAccent
+                                                                    : Colors.orange)),
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                                if (log['second_half_in_time'] != null) ...[
+                                                  const SizedBox(height: 2),
+                                                  Text(
+                                                    'In: ${log['second_half_in_time']}',
+                                                    style: const TextStyle(fontSize: 11, color: Colors.grey),
+                                                  ),
+                                                ],
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
                                   
                                   // For non-admin, render time below status
                                   if (!isAdmin) ...[

@@ -68,6 +68,7 @@ class DailyAttendanceStatus:
     in_time: Optional[time] = None
     out_time: Optional[time] = None
     total_hours: Optional[Decimal] = None
+    attendance_value: Optional[Decimal] = None  # 0.0, 0.5, or 1.0
     updated_at: datetime
 
 

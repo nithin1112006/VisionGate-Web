@@ -1037,13 +1037,27 @@ class _OtherStaffDashboardTabState extends State<OtherStaffDashboardTab> {
   String _formatTimestamp(dynamic raw) {
     final ts = raw?.toString().trim() ?? '';
     if (ts.isEmpty) return '';
+    
+    DateTime? dt;
+    if (ts.contains('T')) {
+      dt = DateTime.tryParse(ts);
+    } else {
+      dt = DateTime.tryParse(ts.replaceAll(' ', 'T'));
+    }
+
+    String formatted = ts;
     if (ts.contains('T')) {
       final parts = ts.split('T');
       final date = parts[0];
       final time = parts[1].split('.').first;
-      return '$date $time';
+      formatted = '$date $time';
     }
-    return ts;
+
+    if (dt != null) {
+      final session = dt.hour < 13 ? 'FN' : 'AN';
+      return '0.5 $session • $formatted';
+    }
+    return formatted;
   }
 
   // Available drawer items for quick access
@@ -1563,15 +1577,20 @@ class _OtherStaffDashboardTabState extends State<OtherStaffDashboardTab> {
                       final avatarIconSize = isSmallScreen ? 14.0 : 18.0;
                       final titleSize = isSmallScreen ? 13.0 : 14.0;
                       final subtitleSize = isSmallScreen ? 11.0 : 12.0;
+                      final punchType = record['punch_type'] as String? ?? 'check_in';
+                      final isCheckOut = punchType == 'check_out';
+                      final punchColor = isCheckOut ? Colors.orange : accent;
+                      final punchIcon = isCheckOut ? Icons.logout : Icons.login;
+                      final punchLabel = isCheckOut ? 'Check Out' : 'Check In';
                       return ListTile(
                         contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
                         leading: CircleAvatar(
                           radius: avatarRadius,
-                          backgroundColor: accent.withValues(alpha: 0.1),
+                          backgroundColor: punchColor.withValues(alpha: 0.12),
                           child: Icon(
-                            Icons.person,
+                            punchIcon,
                             size: avatarIconSize,
-                            color: accent,
+                            color: punchColor,
                           ),
                         ),
                         title: Text(
@@ -1589,12 +1608,39 @@ class _OtherStaffDashboardTabState extends State<OtherStaffDashboardTab> {
                             color: isDark ? Colors.white60 : Colors.grey.shade600,
                           ),
                         ),
-                        trailing: Text(
-                          _formatTimestamp(record['timestamp']),
-                          style: TextStyle(
-                            color: isDark ? Colors.white54 : Colors.grey[600],
-                            fontSize: 12,
-                          ),
+                        trailing: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: punchColor.withValues(alpha: isDark ? 0.22 : 0.10),
+                                borderRadius: BorderRadius.circular(5),
+                                border: Border.all(
+                                  color: punchColor.withValues(alpha: 0.35),
+                                  width: 0.8,
+                                ),
+                              ),
+                              child: Text(
+                                punchLabel,
+                                style: TextStyle(
+                                  color: punchColor,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 3),
+                            Text(
+                              _formatTimestamp(record['timestamp']),
+                              style: TextStyle(
+                                color: isDark ? Colors.white54 : Colors.grey[600],
+                                fontSize: 10,
+                              ),
+                            ),
+                          ],
                         ),
                       );
                     },
@@ -1986,6 +2032,7 @@ class _OtherStaffMarkAttendanceTabState
 
   bool _isWindowAllowed = false;
   String _activeSlotType = 'check_in';
+  String _activeSlotHalf = 'full_day';
   bool _alreadyMarkedCurrentSlot = false;
 
   @override
@@ -2025,39 +2072,69 @@ class _OtherStaffMarkAttendanceTabState
       
       bool allowed = false;
       String slotType = 'check_in';
+      String slotHalf = 'full_day';
       
       if (slotResponse.statusCode == 200) {
         final slotData = jsonDecode(slotResponse.body);
         allowed = slotData['allowed'] ?? false;
         slotType = slotData['slot_type'] ?? 'check_in';
+        slotHalf = slotData['slot_half'] ?? 'full_day';
       }
 
-      final today = DateTime.now().toString().split(' ')[0];
-      final response = await http.get(
-        Uri.parse("$API_URL/other_staff/attendance?date=$today"),
-        headers: {'Authorization': 'Bearer ${widget.token}'},
-      );
-
+      // Check if already marked for the current session (slotType & slotHalf)
       bool alreadyMarked = false;
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        final attendance = data['attendance'] as List? ?? [];
-        final regNo = widget.user['regNo'] ?? widget.user['reg_no'] ?? '';
-        
-        final userRecords = attendance.where(
-          (record) => record['reg_no'] == regNo
-        ).toList();
-        
-        if (userRecords.isNotEmpty) {
-          alreadyMarked = userRecords.any(
-            (record) => record['status'] == slotType
+      final today = DateTime.now().toString().split(' ')[0];
+
+      if (slotHalf == 'first_half' || slotHalf == 'second_half') {
+        final response = await http.get(
+          Uri.parse("$API_URL/api/attendance/personal?start_date=$today&end_date=$today"),
+          headers: {'Authorization': 'Bearer ${widget.token}'},
+        );
+        if (response.statusCode == 200) {
+          final data = jsonDecode(response.body);
+          final records = (data['attendance'] as List? ?? data['records'] as List? ?? []);
+          final todayRecord = records.firstWhere(
+            (r) => r['date']?.toString().startsWith(today) == true || r['timestamp']?.toString().startsWith(today) == true,
+            orElse: () => null,
           );
+
+          if (todayRecord != null) {
+            if (slotHalf == 'first_half') {
+              if (slotType == 'check_in') {
+                alreadyMarked = todayRecord['first_half_in_time'] != null || todayRecord['first_half_status'] == 'Present';
+              } else if (slotType == 'check_out') {
+                alreadyMarked = todayRecord['first_half_out_time'] != null;
+              }
+            } else if (slotHalf == 'second_half') {
+              if (slotType == 'check_in') {
+                alreadyMarked = todayRecord['second_half_in_time'] != null || todayRecord['second_half_status'] == 'Present';
+              } else if (slotType == 'check_out') {
+                alreadyMarked = todayRecord['second_half_out_time'] != null;
+              }
+            }
+          }
+        }
+      } else {
+        final response = await http.get(
+          Uri.parse("$API_URL/other_staff/attendance?date=$today"),
+          headers: {'Authorization': 'Bearer ${widget.token}'},
+        );
+        if (response.statusCode == 200) {
+          final data = jsonDecode(response.body);
+          final attendance = data['attendance'] as List? ?? [];
+          final regNo = widget.user['regNo'] ?? widget.user['reg_no'] ?? '';
+          final userRecords = attendance.where((record) => record['reg_no'] == regNo).toList();
+          if (userRecords.isNotEmpty) {
+            alreadyMarked = userRecords.any((record) => record['status'] == slotType);
+          }
         }
       }
+
 
       setState(() {
         _isWindowAllowed = allowed;
         _activeSlotType = slotType;
+        _activeSlotHalf = slotHalf;
         _alreadyMarkedCurrentSlot = alreadyMarked;
         _isLoading = false;
       });
@@ -2182,8 +2259,8 @@ class _OtherStaffMarkAttendanceTabState
                               !_isWindowAllowed
                                   ? "Outside active attendance window"
                                   : (_alreadyMarkedCurrentSlot
-                                      ? "Already marked ${_activeSlotType == 'check_in' ? 'Check-In' : 'Check-Out'} today"
-                                      : "Active Slot: ${_activeSlotType == 'check_in' ? 'Check-In' : 'Check-Out'} (Verification Required)"),
+                                      ? "Already marked ${_activeSlotHalf == 'first_half' ? 'FN (Morning)' : _activeSlotHalf == 'second_half' ? 'AN (Afternoon)' : _activeSlotType == 'check_in' ? 'Check-In' : 'Check-Out'} today"
+                                      : "Active: ${_activeSlotHalf == 'first_half' ? 'FN Morning Slot' : _activeSlotHalf == 'second_half' ? 'AN Afternoon Slot' : _activeSlotType == 'check_in' ? 'Check-In Slot' : 'Check-Out Slot'} — Tap to mark"),
                               style: TextStyle(fontSize: 14, color: !_isWindowAllowed ? Colors.red[700] : (_alreadyMarkedCurrentSlot ? Colors.green[700] : Colors.orange[700])),
                             ),
                           ],
@@ -2222,7 +2299,7 @@ class _OtherStaffMarkAttendanceTabState
                         elevation: 8, shadowColor: const Color(0xFF007AFF).withValues(alpha: 0.4),
                       ),
                       icon: const Icon(Icons.qr_code_scanner),
-                      label: Text(!_isWindowAllowed ? "Outside Window" : (_alreadyMarkedCurrentSlot ? "Already ${_activeSlotType == 'check_in' ? 'Checked-In' : 'Checked-Out'}" : "Mark ${_activeSlotType == 'check_in' ? 'Check-In' : 'Check-Out'}")),
+                      label: Text(!_isWindowAllowed ? "Outside Window" : (_alreadyMarkedCurrentSlot ? "Already marked ${_activeSlotHalf == 'first_half' ? 'FN' : _activeSlotHalf == 'second_half' ? 'AN' : _activeSlotType == 'check_in' ? 'Check-In' : 'Check-Out'}" : "Mark ${_activeSlotHalf == 'first_half' ? 'FN Attendance' : _activeSlotHalf == 'second_half' ? 'AN Attendance' : _activeSlotType == 'check_in' ? 'Check-In' : 'Check-Out'}")),
                     ),
                   ),
                 ],

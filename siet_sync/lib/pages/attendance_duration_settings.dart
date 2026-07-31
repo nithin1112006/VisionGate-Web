@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import '../config/college_ip_config.dart';
 
@@ -22,6 +23,14 @@ class _AttendanceDurationSettingsState extends State<AttendanceDurationSettings>
   String _fhEnd = '13:00';
   String _shStart = '13:00';
   String _shEnd = '17:30';
+
+  // Auto-extension settings
+  bool _autoExpandCheckinEnabled = true;
+  bool _autoExpandCheckoutEnabled = true;
+  bool _requireFnCheckOut = false;
+  int _autoExpandFnMins = 5;
+  int _autoExpandAnMins = 5;
+  int _autoExpandMins = 5;
 
   @override
   void initState() {
@@ -46,6 +55,16 @@ class _AttendanceDurationSettingsState extends State<AttendanceDurationSettings>
           _shStart = sb['second_half_start'] ?? '13:00';
           _shEnd = sb['second_half_end'] ?? '17:30';
         }
+        if (data['auto_expansion'] != null) {
+          final ae = data['auto_expansion'];
+          _autoExpandCheckinEnabled = ae['auto_expand_checkin_enabled'] ?? true;
+          _autoExpandCheckoutEnabled = ae['auto_expand_checkout_enabled'] ?? true;
+          _requireFnCheckOut = ae['require_fn_check_out'] ?? false;
+          _autoExpandFnMins = ae['auto_expand_fn_minutes'] ?? 5;
+          _autoExpandAnMins = ae['auto_expand_an_minutes'] ?? 5;
+          _autoExpandMins = ae['auto_expand_minutes'] ?? 5;
+        }
+
         if (data['data'] != null && (data['data'] as List).isNotEmpty) {
           setState(() {
             _slots = (data['data'] as List).map((e) {
@@ -82,6 +101,31 @@ class _AttendanceDurationSettingsState extends State<AttendanceDurationSettings>
   }
 
   Future<void> _saveSettings() async {
+    // Validate Extension Durations (Max 60 mins)
+    if (_autoExpandCheckinEnabled || _autoExpandCheckoutEnabled) {
+      if (_autoExpandFnMins > 60) {
+        _showConflictDialog('FN Extension Duration cannot exceed 60 minutes. Current value: $_autoExpandFnMins mins.');
+        return;
+      }
+      if (_autoExpandAnMins > 60) {
+        _showConflictDialog('AN Extension Duration cannot exceed 60 minutes. Current value: $_autoExpandAnMins mins.');
+        return;
+      }
+    }
+
+    // Validate Normal Slot Durations (Max 120 mins, Min 1 min)
+    for (int i = 0; i < _slots.length; i++) {
+      final dur = _slots[i]['duration_minutes'];
+      if (dur == null || dur <= 0) {
+        _showConflictDialog('Slot ${i + 1} duration must be greater than 0 minutes.');
+        return;
+      }
+      if (dur > 120) {
+        _showConflictDialog('Slot ${i + 1} duration cannot exceed 120 minutes (2 hours). Current value: $dur mins.');
+        return;
+      }
+    }
+
     setState(() {
       _isSaving = true;
     });
@@ -102,8 +146,21 @@ class _AttendanceDurationSettingsState extends State<AttendanceDurationSettings>
             'second_half_start': _shStart,
             'second_half_end': _shEnd,
           },
+          'auto_expansion': {
+            'auto_expand_checkin_enabled': _autoExpandCheckinEnabled,
+            'auto_expand_checkout_enabled': _autoExpandCheckoutEnabled,
+            'require_fn_check_out': _requireFnCheckOut,
+            'auto_expand_fn_minutes': _autoExpandFnMins,
+            'auto_expand_an_minutes': _autoExpandAnMins,
+            'auto_expand_minutes': _autoExpandMins,
+          },
+
         }),
       );
+
+
+
+
 
       if (response.statusCode == 200) {
         if (mounted) {
@@ -423,6 +480,191 @@ class _AttendanceDurationSettingsState extends State<AttendanceDurationSettings>
                       ),
                     ),
                   ),
+                  const SizedBox(height: 16),
+
+                  // Auto Slot Extension Card (Check-In & Check-Out for FN / AN)
+                  Card(
+                    elevation: 2,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Row(
+                            children: [
+                              Icon(Icons.more_time_rounded, color: Color(0xFF007AFF), size: 22),
+                              SizedBox(width: 10),
+                              Text(
+                                'Auto Slot Extensions (FN & AN)',
+                                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'Automatically extends active Check-In and Check-Out slots by the configured duration to prevent sudden window cut-offs for staff during FN & AN sessions.',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Theme.of(context).brightness == Brightness.dark ? Colors.white60 : Colors.grey[600],
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          const Divider(height: 1),
+                          const SizedBox(height: 8),
+
+                          // Check-In Toggle
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Row(
+                                children: [
+                                  Icon(Icons.login_rounded, color: Colors.green, size: 18),
+                                  SizedBox(width: 8),
+                                  Text(
+                                    'Extend Check-In Slots',
+                                    style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+                                  ),
+                                ],
+                              ),
+                              Switch(
+                                value: _autoExpandCheckinEnabled,
+                                activeColor: const Color(0xFF007AFF),
+                                onChanged: (val) {
+                                  setState(() => _autoExpandCheckinEnabled = val);
+                                },
+                              ),
+                            ],
+                          ),
+
+                          // Check-Out Toggle
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Row(
+                                children: [
+                                  Icon(Icons.logout_rounded, color: Colors.orange, size: 18),
+                                  SizedBox(width: 8),
+                                  Text(
+                                    'Extend Check-Out Slots',
+                                    style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+                                  ),
+                                ],
+                              ),
+                              Switch(
+                                value: _autoExpandCheckoutEnabled,
+                                activeColor: const Color(0xFF007AFF),
+                                onChanged: (val) {
+                                  setState(() => _autoExpandCheckoutEnabled = val);
+                                },
+                              ),
+                            ],
+                          ),
+
+                          const SizedBox(height: 8),
+                          const Divider(height: 1),
+                          const SizedBox(height: 8),
+
+                          // Require FN Check-Out Toggle
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      'Require Morning (FN) Check-Out',
+                                      style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+                                    ),
+                                    SizedBox(height: 2),
+                                    Text(
+                                      'When OFF, staff do not need to scan Check-Out for FN session',
+                                      style: TextStyle(fontSize: 11, color: Colors.grey),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              Switch(
+                                value: _requireFnCheckOut,
+                                activeColor: const Color(0xFF007AFF),
+                                onChanged: (val) {
+                                  setState(() => _requireFnCheckOut = val);
+                                },
+                              ),
+                            ],
+                          ),
+
+
+                          if (_autoExpandCheckinEnabled || _autoExpandCheckoutEnabled) ...[
+                            const SizedBox(height: 12),
+                            const Divider(height: 1),
+                            const SizedBox(height: 10),
+                            const Text(
+                              'Custom Extension Durations',
+                              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                            ),
+                            const SizedBox(height: 8),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      const Text('FN Extension', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                                      const SizedBox(height: 4),
+                                      TextFormField(
+                                        initialValue: _autoExpandFnMins.toString(),
+                                        keyboardType: TextInputType.number,
+                                        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                                        decoration: InputDecoration(
+                                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                                          contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                                          suffixText: 'mins',
+                                          isDense: true,
+                                          errorText: _autoExpandFnMins > 60 ? 'Max 60 mins' : null,
+                                        ),
+                                        onChanged: (val) {
+                                          final parsed = int.tryParse(val.trim()) ?? 0;
+                                          setState(() => _autoExpandFnMins = parsed);
+                                        },
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(width: 16),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      const Text('AN Extension', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                                      const SizedBox(height: 4),
+                                      TextFormField(
+                                        initialValue: _autoExpandAnMins.toString(),
+                                        keyboardType: TextInputType.number,
+                                        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                                        decoration: InputDecoration(
+                                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                                          contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                                          suffixText: 'mins',
+                                          isDense: true,
+                                          errorText: _autoExpandAnMins > 60 ? 'Max 60 mins' : null,
+                                        ),
+                                        onChanged: (val) {
+                                          final parsed = int.tryParse(val.trim()) ?? 0;
+                                          setState(() => _autoExpandAnMins = parsed);
+                                        },
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
                   const SizedBox(height: 24),
 
                   // Slots List
@@ -634,28 +876,22 @@ class _AttendanceDurationSettingsState extends State<AttendanceDurationSettings>
                                           ),
                                         ),
                                         const SizedBox(height: 8),
-                                        Container(
-                                          padding: const EdgeInsets.symmetric(horizontal: 12),
-                                          decoration: BoxDecoration(
-                                            border: Border.all(color: Colors.grey[300]!),
-                                            borderRadius: BorderRadius.circular(8),
+                                        TextFormField(
+                                          initialValue: (_slots[index]['duration_minutes'] ?? 30).toString(),
+                                          keyboardType: TextInputType.number,
+                                          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                                          decoration: InputDecoration(
+                                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                                            contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                                            suffixText: 'mins',
+                                            errorText: ((_slots[index]['duration_minutes'] ?? 30) > 120) ? 'Max 120 mins' : null,
                                           ),
-                                          child: DropdownButton<int>(
-                                            value: _slots[index]['duration_minutes'] ?? 30,
-                                            isExpanded: true,
-                                            underline: const SizedBox(),
-                                            items: [15, 30, 45, 60, 90, 120]
-                                                .map((value) => DropdownMenuItem(
-                                                      value: value,
-                                                      child: Text('$value minutes'),
-                                                    ))
-                                                .toList(),
-                                            onChanged: (value) {
-                                              setState(() {
-                                                _slots[index]['duration_minutes'] = value;
-                                              });
-                                            },
-                                          ),
+                                          onChanged: (val) {
+                                            final parsed = int.tryParse(val.trim()) ?? 0;
+                                            setState(() {
+                                              _slots[index]['duration_minutes'] = parsed;
+                                            });
+                                          },
                                         ),
                                       ],
                                     ),
@@ -715,9 +951,54 @@ class _AttendanceDurationSettingsState extends State<AttendanceDurationSettings>
 
                   const SizedBox(height: 32),
 
-                  // Info Card
+                  // FN/AN Half-Day Info Card
+                  Card(
+                    color: Colors.amber[50],
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Icon(Icons.wb_sunny_outlined, color: Colors.amber[800]),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'FN / AN Half-Day Attendance',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.amber[900],
+                                    fontSize: 14,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  '• Assign each slot to FN (Morning) or AN (Afternoon) session.\n'
+                                  '• FN slot marks morning attendance = 0.5 value.\n'
+                                  '• AN slot marks afternoon attendance = 0.5 value.\n'
+                                  '• Both FN + AN = Full Day = 1.0 value.\n'
+                                  '• The system auto-enables Half-Day mode when any FN/AN slot exists.',
+                                  style: TextStyle(
+                                    color: Colors.amber[900],
+                                    fontSize: 12,
+                                    height: 1.5,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  // How it works card
                   Card(
                     color: Colors.blue[50],
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                     child: Padding(
                       padding: const EdgeInsets.all(16),
                       child: Row(
@@ -739,8 +1020,9 @@ class _AttendanceDurationSettingsState extends State<AttendanceDurationSettings>
                                 const SizedBox(height: 8),
                                 Text(
                                   '• Staff can only mark attendance during the configured time windows.\n'
-                                  '• If no slots are enabled, attendance can be marked at any time.\n'
-                                  '• Each slot defines when attendance window opens and for how long it stays open.',
+                                  '• The slot\'s start time + duration defines the window.\n'
+                                  '• Slots must stay within their assigned session boundary.\n'
+                                  '• Maximum 5 slots allowed.',
                                   style: TextStyle(
                                     color: Colors.blue[700],
                                     fontSize: 13,

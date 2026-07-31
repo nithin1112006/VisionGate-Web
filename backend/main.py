@@ -1850,8 +1850,21 @@ async def get_attendance_duration_settings(request: Request):
         "second_half_start": hd_settings["second_half_start"],
         "second_half_end": hd_settings["second_half_end"],
     }
+    auto_expansion = {
+        "auto_expand_checkin_enabled": hd_settings["auto_expand_checkin_enabled"],
+        "auto_expand_checkout_enabled": hd_settings["auto_expand_checkout_enabled"],
+        "auto_expand_fn_minutes": hd_settings["auto_expand_fn_minutes"],
+        "auto_expand_an_minutes": hd_settings["auto_expand_an_minutes"],
+        "auto_expand_minutes": hd_settings["auto_expand_minutes"],
+        "require_fn_check_out": hd_settings["require_fn_check_out"],
+    }
 
-    return {"success": True, "data": settings, "session_boundaries": session_boundaries}
+    return {
+        "success": True,
+        "data": settings,
+        "session_boundaries": session_boundaries,
+        "auto_expansion": auto_expansion,
+    }
 
 
 
@@ -2016,6 +2029,43 @@ async def save_attendance_duration_settings(request: Request):
                 raise HTTPException(status_code=400, detail=err_msg)
 
 
+    # Validate slot durations (Max 120 mins)
+    for setting in settings:
+        dur = int(setting.get("duration_minutes", 30))
+        if dur > 120:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Slot {setting.get('slot_number')} duration ({dur} mins) exceeds maximum limit of 120 minutes."
+            )
+        if dur <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Slot {setting.get('slot_number')} duration must be greater than 0 minutes."
+            )
+
+    # Validate auto extension durations (Max 60 mins) if provided
+    body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+    if "auto_expansion" in body:
+        auto_exp = body["auto_expansion"]
+        fn_ext = int(auto_exp.get("auto_expand_fn_minutes", 5))
+        an_ext = int(auto_exp.get("auto_expand_an_minutes", 5))
+        def_ext = int(auto_exp.get("auto_expand_minutes", 5))
+        if fn_ext > 60:
+            raise HTTPException(
+                status_code=400,
+                detail=f"FN Extension duration ({fn_ext} mins) exceeds maximum limit of 60 minutes."
+            )
+        if an_ext > 60:
+            raise HTTPException(
+                status_code=400,
+                detail=f"AN Extension duration ({an_ext} mins) exceeds maximum limit of 60 minutes."
+            )
+        if def_ext > 60:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Extension duration ({def_ext} mins) exceeds maximum limit of 60 minutes."
+            )
+
     try:
         # Delete existing settings and insert new ones
         cursor.execute("DELETE FROM attendance_duration_settings")
@@ -2060,6 +2110,42 @@ async def save_attendance_duration_settings(request: Request):
 
         conn.commit()
 
+        # Save auto expansion settings if provided
+        body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+        if "auto_expansion" in body:
+            auto_exp = body["auto_expansion"]
+            if "auto_expand_checkin_enabled" in auto_exp:
+                val = "true" if auto_exp["auto_expand_checkin_enabled"] else "false"
+                _save_leave_setting("auto_expand_checkin_enabled", val, admin_user["name"])
+            if "auto_expand_checkout_enabled" in auto_exp:
+                val_out = "true" if auto_exp["auto_expand_checkout_enabled"] else "false"
+                _save_leave_setting("auto_expand_checkout_enabled", val_out, admin_user["name"])
+            if "auto_expand_fn_minutes" in auto_exp:
+                mins_fn = str(int(auto_exp["auto_expand_fn_minutes"]))
+                _save_leave_setting("auto_expand_fn_minutes", mins_fn, admin_user["name"])
+            if "auto_expand_an_minutes" in auto_exp:
+                mins_an = str(int(auto_exp["auto_expand_an_minutes"]))
+                _save_leave_setting("auto_expand_an_minutes", mins_an, admin_user["name"])
+            if "auto_expand_minutes" in auto_exp:
+                mins = str(int(auto_exp["auto_expand_minutes"]))
+                _save_leave_setting("auto_expand_minutes", mins, admin_user["name"])
+            if "require_fn_check_out" in auto_exp:
+                req_fn = "true" if auto_exp["require_fn_check_out"] else "false"
+                _save_leave_setting("require_fn_check_out", req_fn, admin_user["name"])
+
+        # Auto-enable half_day_enabled when any slot is configured for FN or AN
+        has_half_day_slots = any(
+            s.get("slot_half") in ("first_half", "second_half") and
+            (s.get("is_enabled") is True or s.get("is_enabled") == 1 or s.get("is_enabled") == "true")
+            for s in settings
+        )
+        _save_leave_setting(
+            "half_day_enabled",
+            "true" if has_half_day_slots else "false",
+            admin_user["name"],
+        )
+        conn.commit()
+
         log_audit_event(
             "ATTENDANCE_DURATION_UPDATED",
             admin_user["reg_no"],
@@ -2076,12 +2162,36 @@ async def save_attendance_duration_settings(request: Request):
         raise HTTPException(status_code=500, detail="Failed to save duration settings")
 
 
+def _calculate_effective_slot_duration(slot_type: str, slot_half: str, base_duration: int) -> tuple[int, bool, int]:
+    """
+    Calculate effective slot duration applying auto-extension for FN and AN check-in & check-out slots.
+    Returns: (effective_duration, is_auto_extended, applied_ext_mins)
+    """
+    hd_settings = _get_half_day_settings()
+    auto_expand_checkin = hd_settings.get("auto_expand_checkin_enabled", True)
+    auto_expand_checkout = hd_settings.get("auto_expand_checkout_enabled", True)
+    auto_expand_fn_mins = hd_settings.get("auto_expand_fn_minutes", 5)
+    auto_expand_an_mins = hd_settings.get("auto_expand_an_minutes", 5)
+    auto_expand_default_mins = hd_settings.get("auto_expand_minutes", 5)
+
+    if (slot_type == "check_in" and auto_expand_checkin) or (slot_type == "check_out" and auto_expand_checkout):
+        if slot_half == "first_half":
+            applied_ext_mins = auto_expand_fn_mins
+        elif slot_half == "second_half":
+            applied_ext_mins = auto_expand_an_mins
+        else:
+            applied_ext_mins = auto_expand_default_mins
+        return base_duration + applied_ext_mins, True, applied_ext_mins
+
+    return base_duration, False, 0
+
+
 @app.get("/admin/attendance/duration/check")
 async def check_attendance_window():
     """Check if current time is within any attendance window - Public endpoint"""
 
     cursor.execute("""
-        SELECT slot_number, start_time, duration_minutes, is_enabled, slot_type
+        SELECT slot_number, start_time, duration_minutes, is_enabled, slot_type, slot_half
         FROM attendance_duration_settings
         WHERE is_enabled = 1
         ORDER BY slot_number ASC
@@ -2139,32 +2249,44 @@ async def check_attendance_window():
 
     current_time = datetime.now()
     current_time_str = current_time.strftime("%H:%M")
+    hd_settings = _get_half_day_settings()
+    auto_expand_checkin = hd_settings.get("auto_expand_checkin_enabled", True)
+    auto_expand_checkout = hd_settings.get("auto_expand_checkout_enabled", True)
+    auto_expand_fn_mins = hd_settings.get("auto_expand_fn_minutes", 5)
+    auto_expand_an_mins = hd_settings.get("auto_expand_an_minutes", 5)
+    auto_expand_default_mins = hd_settings.get("auto_expand_minutes", 5)
 
     for row in rows:
         slot_number = row[0]
         start_time = row[1]  # Format: HH:MM
         duration_minutes = row[2]
         slot_type = row[4] if len(row) > 4 and row[4] else "check_in"
+        slot_half = row[5] if len(row) > 5 and row[5] else "full_day"
+
+        effective_duration, is_auto_extended, applied_ext_mins = _calculate_effective_slot_duration(slot_type, slot_half, duration_minutes)
 
         # Parse start time
         start_hour, start_minute = map(int, start_time.split(":"))
         start_datetime = current_time.replace(
             hour=start_hour, minute=start_minute, second=0, microsecond=0
         )
-        end_datetime = start_datetime + timedelta(minutes=duration_minutes)
+        end_datetime = start_datetime + timedelta(minutes=effective_duration)
 
         # Check if current time is within the window
         if start_datetime <= current_time < end_datetime:
             return {
                 "allowed": True,
-                "message": f"Within attendance window {slot_number}",
+                "message": f"Within attendance window {slot_number}" + (" (Auto Extended)" if is_auto_extended else ""),
                 "current_slot": slot_number,
                 "slot_type": slot_type,
+                "slot_half": slot_half,
                 "start_time": start_time,
                 "end_time": end_datetime.strftime("%H:%M"),
                 "remaining_minutes": int(
                     (end_datetime - current_time).total_seconds() / 60
                 ),
+                "is_auto_extended": is_auto_extended,
+                "extended_minutes": applied_ext_mins if is_auto_extended else 0,
             }
 
     # If not in normal slot, check active CCL slot
@@ -2569,7 +2691,21 @@ async def expire_cl_now(request: Request):
     """Immediately zero out all CL balances (admin-triggered expiry) — Admin only."""
     admin = verify_admin_token(request)
     admin_name = admin.get("name", "admin") if admin else "admin"
+    today_str = datetime.now().strftime("%Y-%m-%d")
     try:
+        # Fetch non-zero CL records before zeroing out to record in expired_leaves
+        cursor.execute("""
+            SELECT reg_no, user_name, dept, role, (current_month_cl_available + accumulated_cl) as total_cl
+            FROM casual_leave
+            WHERE current_month_cl_available > 0 OR accumulated_cl > 0
+        """)
+        cl_rows = cursor.fetchall()
+        for row in cl_rows:
+            cursor.execute("""
+                INSERT INTO expired_leaves (reg_no, user_name, dept, role, leave_type, expired_amount, expiry_date, reason)
+                VALUES (?, ?, ?, ?, 'Casual Leave (CL)', ?, ?, 'Manually expired by Admin')
+            """, (row[0], row[1], row[2], row[3], float(row[4]), today_str))
+
         cursor.execute(
             """
             UPDATE casual_leave
@@ -2597,7 +2733,21 @@ async def expire_el_now(request: Request):
     """Immediately zero out all EL balances (admin-triggered expiry) — Admin only."""
     admin = verify_admin_token(request)
     admin_name = admin.get("name", "admin") if admin else "admin"
+    today_str = datetime.now().strftime("%Y-%m-%d")
     try:
+        # Fetch non-zero EL records before zeroing out to record in expired_leaves
+        cursor.execute("""
+            SELECT reg_no, user_name, dept, role, balance
+            FROM earned_leave
+            WHERE balance > 0
+        """)
+        el_rows = cursor.fetchall()
+        for row in el_rows:
+            cursor.execute("""
+                INSERT INTO expired_leaves (reg_no, user_name, dept, role, leave_type, expired_amount, expiry_date, reason)
+                VALUES (?, ?, ?, ?, 'Earned Leave (EL)', ?, ?, 'Manually expired by Admin')
+            """, (row[0], row[1], row[2], row[3], float(row[4]), today_str))
+
         cursor.execute(
             """
             UPDATE earned_leave
@@ -2617,6 +2767,124 @@ async def expire_el_now(request: Request):
     except Exception as e:
         print(f"[EL Expiry] Error: {e}")
         raise HTTPException(status_code=500, detail=f"EL expiry failed: {e}")
+
+
+@app.get("/leave/expired")
+async def get_expired_leaves(request: Request, reg_no: str = None, dept: str = None):
+    """Get historical list of expired leaves.
+    Admin gets all/filtered by reg_no/dept; regular users get their own expired leaves.
+    """
+    user = verify_any_user_token(request)
+    is_admin = user.get("role") == "admin"
+
+    try:
+        # Check and process automated expiry against set cl_expiry_date and el_expiry_date
+        _process_auto_leave_expiry()
+
+        query = """
+            SELECT id, reg_no, user_name, dept, role, leave_type, expired_amount, expiry_date, reason, created_at
+            FROM expired_leaves
+        """
+        params = []
+        conditions = []
+
+        if not is_admin:
+            conditions.append("reg_no = ?")
+            params.append(user["reg_no"])
+        else:
+            if reg_no:
+                conditions.append("reg_no = ?")
+                params.append(reg_no)
+            if dept and dept != "All":
+                conditions.append("dept = ?")
+                params.append(dept)
+
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+
+        query += " ORDER BY expiry_date DESC, created_at DESC"
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+
+        expired_list = [
+            {
+                "id": r[0],
+                "reg_no": r[1],
+                "user_name": r[2],
+                "dept": r[3],
+                "role": r[4],
+                "leave_type": r[5],
+                "expired_amount": float(r[6]),
+                "expiry_date": str(r[7]),
+                "reason": r[8],
+                "created_at": _ts(r[9]),
+            }
+            for r in rows
+        ]
+
+        return {
+            "success": True,
+            "expired_leaves": expired_list,
+            "count": len(expired_list),
+        }
+    except Exception as e:
+        print(f"[get_expired_leaves] Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch expired leaves")
+
+
+def _process_auto_leave_expiry():
+    """Automated check if today reached or passed cl_expiry_date or el_expiry_date."""
+    try:
+        s = _get_half_day_settings()
+        cl_exp = s.get("cl_expiry_date")
+        el_exp = s.get("el_expiry_date")
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
+        # Process CL Expiry
+        if cl_exp and today_str >= cl_exp:
+            cursor.execute("""
+                SELECT reg_no, user_name, dept, role, (current_month_cl_available + accumulated_cl) as total_cl
+                FROM casual_leave
+                WHERE current_month_cl_available > 0 OR accumulated_cl > 0
+            """)
+            cl_rows = cursor.fetchall()
+            for row in cl_rows:
+                cursor.execute("""
+                    INSERT INTO expired_leaves (reg_no, user_name, dept, role, leave_type, expired_amount, expiry_date, reason)
+                    VALUES (?, ?, ?, ?, 'Casual Leave (CL)', ?, ?, 'Automated expiry date reached')
+                """, (row[0], row[1], row[2], row[3], float(row[4]), cl_exp))
+
+            cursor.execute("""
+                UPDATE casual_leave
+                SET current_month_cl_available = 0, accumulated_cl = 0, last_updated = CURRENT_TIMESTAMP
+                WHERE current_month_cl_available > 0 OR accumulated_cl > 0
+            """)
+            _save_leave_setting("cl_expiry_date", "", "system")
+
+        # Process EL Expiry
+        if el_exp and today_str >= el_exp:
+            cursor.execute("""
+                SELECT reg_no, user_name, dept, role, balance
+                FROM earned_leave
+                WHERE balance > 0
+            """)
+            el_rows = cursor.fetchall()
+            for row in el_rows:
+                cursor.execute("""
+                    INSERT INTO expired_leaves (reg_no, user_name, dept, role, leave_type, expired_amount, expiry_date, reason)
+                    VALUES (?, ?, ?, ?, 'Earned Leave (EL)', ?, ?, 'Automated expiry date reached')
+                """, (row[0], row[1], row[2], row[3], float(row[4]), el_exp))
+
+            cursor.execute("""
+                UPDATE earned_leave
+                SET balance = 0.0, updated_at = CURRENT_TIMESTAMP
+                WHERE balance > 0
+            """)
+            _save_leave_setting("el_expiry_date", "", "system")
+
+        conn.commit()
+    except Exception as e:
+        print(f"[_process_auto_leave_expiry] Error: {e}")
 
 
 @app.post("/admin/half-day/mark-absent")
@@ -3817,16 +4085,42 @@ def _get_leave_settings(force: bool = False) -> dict:
 
 
 def _get_half_day_settings() -> dict:
-    """Return half-day config dict with typed values."""
+    """Return half-day config dict with typed values.
+    
+    half_day_enabled is auto-detected: True if any enabled slot in
+    attendance_duration_settings has slot_half = 'first_half' or 'second_half'.
+    """
     s = _get_leave_settings()
     default_3m = (datetime.now() + timedelta(days=90)).strftime("%Y-%m-%d")
+
+    # Auto-detect half_day_enabled from slot configuration
+    half_day_from_settings = str(s.get("half_day_enabled", "false")).lower() == "true"
+    half_day_from_slots = False
+    try:
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM attendance_duration_settings
+            WHERE is_enabled = 1 AND slot_half IN ('first_half', 'second_half')
+            """
+        )
+        row = cursor.fetchone()
+        half_day_from_slots = (row[0] > 0) if row else False
+    except Exception:
+        pass
+
     return {
-        "half_day_enabled": str(s.get("half_day_enabled", "false")).lower() == "true",
+        "half_day_enabled": half_day_from_settings or half_day_from_slots,
         "first_half_label": s.get("first_half_label", "First Half"),
         "second_half_label": s.get("second_half_label", "Second Half"),
         "cl_monthly_allocation": int(s.get("cl_monthly_allocation", "1") or "1"),
         "cl_expiry_date": s.get("cl_expiry_date") or default_3m,
         "el_expiry_date": s.get("el_expiry_date") or default_3m,
+        "auto_expand_checkin_enabled": str(s.get("auto_expand_checkin_enabled", "true")).lower() == "true",
+        "auto_expand_checkout_enabled": str(s.get("auto_expand_checkout_enabled", "true")).lower() == "true",
+        "auto_expand_fn_minutes": int(s.get("auto_expand_fn_minutes", s.get("auto_expand_minutes", "5")) or "5"),
+        "auto_expand_an_minutes": int(s.get("auto_expand_an_minutes", s.get("auto_expand_minutes", "5")) or "5"),
+        "auto_expand_minutes": int(s.get("auto_expand_minutes", "5") or "5"),
+        "require_fn_check_out": str(s.get("require_fn_check_out", "false")).lower() == "true",
         "first_half_start": s.get("first_half_start", "08:30"),
         "first_half_end": s.get("first_half_end", "13:00"),
         "second_half_start": s.get("second_half_start", "13:00"),
@@ -3852,33 +4146,83 @@ def _save_leave_setting(key: str, value: str, updated_by: str = "system"):
     _leave_settings_last_refresh = 0  # invalidate cache
 
 
-def _compute_daily_status(first_half: str | None, second_half: str | None) -> str:
+def _compute_daily_status(
+    first_half: str | None,
+    second_half: str | None,
+    target_date: str | None = None,
+    current_dt: datetime | None = None,
+) -> str:
     """Compute overall daily status from first and second half statuses.
 
-    Rules (Q4/Q6):
-    - Both Present                      → 'Present'
-    - One Present + one Absent          → 'Half Day'
-    - One Present + one Leave           → 'Present' (leave covers absent half)
-    - Both Leave                        → 'Leave'
-    - One Leave  + one Absent           → 'Half Day'
-    - Both Absent or NULL               → 'Absent'
-    - NULL is treated the same as Absent for completed days.
+    Rules:
+    - Both Present                                → 'Present'
+    - One Present + one Pending (window active)   → 'Half Day' (FN/AN Present • pending other)
+    - One Present + one Absent (window passed)    → 'Half Day'
+    - One Present + one Leave                     → 'Half Day'
+    - Both Leave                                  → 'Leave'
+    - Both Absent                                 → 'Absent'
+    - Both Pending (window active/future date)    → 'Pending'
     """
-    fh = (first_half or "Absent").strip()
-    sh = (second_half or "Absent").strip()
+    if current_dt is None:
+        current_dt = datetime.now()
+
+    today_str = current_dt.strftime("%Y-%m-%d")
+    hd_settings = _get_half_day_settings()
+
+    # Determine if session windows have passed
+    fh_passed = True
+    sh_passed = True
+
+    if target_date:
+        if target_date > today_str:
+            fh_passed = False
+            sh_passed = False
+        elif target_date == today_str:
+            now_time = current_dt.time()
+            try:
+                fh_end_time = datetime.strptime(
+                    hd_settings.get("first_half_end", "13:00"), "%H:%M"
+                ).time()
+                sh_end_time = datetime.strptime(
+                    hd_settings.get("second_half_end", "17:30"), "%H:%M"
+                ).time()
+                fh_passed = now_time > fh_end_time
+                sh_passed = now_time > sh_end_time
+            except Exception:
+                cutoff = datetime.strptime("13:00", "%H:%M").time()
+                fh_passed = now_time > cutoff
+                sh_passed = now_time > cutoff
+
+    # Evaluate un-scanned sessions (None or Pending)
+    if not first_half or first_half == "Pending":
+        fh = "Absent" if fh_passed else "Pending"
+    else:
+        fh = first_half.strip()
+
+    if not second_half or second_half == "Pending":
+        sh = "Absent" if sh_passed else "Pending"
+    else:
+        sh = second_half.strip()
 
     pair = (fh, sh)
 
     if pair == ("Present", "Present"):
         return "Present"
-    if pair in (("Present", "Absent"), ("Absent", "Present"), ("Present", "Leave"), ("Leave", "Present")):
+    if "Present" in pair:
         return "Half Day"
     if pair == ("Leave", "Leave"):
         return "Leave"
-    if pair in (("Leave", "Absent"), ("Absent", "Leave")):
+    if "Leave" in pair:
         return "Half Day"
-    # Both Absent
-    return "Absent"
+    if pair == ("Absent", "Absent"):
+        return "Absent"
+    if "Absent" in pair:
+        return "Half Day"
+
+    # Both Pending
+    return "Pending"
+
+
 
 
 def _compute_half_day_value(status: str) -> float:
@@ -3888,6 +4232,61 @@ def _compute_half_day_value(status: str) -> float:
     if status == "Half Day":
         return 0.5
     return 0.0
+
+
+def _compute_attendance_value_from_halves(first_half: str | None, second_half: str | None) -> float:
+    """Calculate attendance value (0.0, 0.5, or 1.0) based on half-day statuses.
+    
+    Args:
+        first_half: Status of first half ('Present', 'Absent', 'Leave', or None)
+        second_half: Status of second half ('Present', 'Absent', 'Leave', or None)
+    
+    Returns:
+        float: Attendance value (1.0 for both present, 0.5 for one present, 0.0 otherwise)
+    """
+    fh = (first_half or "Absent").strip()
+    sh = (second_half or "Absent").strip()
+    
+    value = 0.0
+    if fh == "Present":
+        value += 0.5
+    if sh == "Present":
+        value += 0.5
+    
+    return value
+
+
+def _format_scan_status(status_val: str | None, timestamp_val) -> str:
+    """Format the scan status to show if it is first half or second half check in/out."""
+    if not status_val:
+        return "Present"
+    
+    # Extract action based on raw DB status value
+    sv = status_val.lower().strip()
+    if sv == "check_out":
+        action = "Check-out"
+    elif sv == "check_in":
+        action = "Check-in"
+    else:
+        # Unknown raw value – just title-case it
+        return status_val.replace('_', ' ').title()
+    
+    # Try to determine half based on time (cutoff at 13:00 = 1 PM)
+    try:
+        if isinstance(timestamp_val, str):
+            # Normalise: take first 19 chars, replace T with space
+            ts_norm = timestamp_val[:19].replace("T", " ")
+            dt = datetime.strptime(ts_norm, "%Y-%m-%d %H:%M:%S")
+        else:
+            dt = timestamp_val
+        
+        if dt.hour < 13:
+            return f"First Half {action}"
+        else:
+            return f"Second Half {action}"
+    except Exception:
+        # Fallback — still return the correct action label
+        return action
 
 
 def _mark_halves_absent_for_day(date_str: str):
@@ -3918,16 +4317,20 @@ def _mark_halves_absent_for_day(date_str: str):
             new_fh = fh if fh else "Absent"
             new_sh = sh if sh else "Absent"
             new_status = _compute_daily_status(new_fh, new_sh)
+            # Calculate attendance value
+            attendance_value = _compute_attendance_value_from_halves(new_fh, new_sh)
+            
             cursor.execute(
                 """
                 UPDATE daily_attendance_status
                 SET first_half_status = %s,
                     second_half_status = %s,
                     status = %s,
+                    attendance_value = %s,
                     marked_at = CURRENT_TIMESTAMP
                 WHERE reg_no = %s AND date = %s
             """,
-                (new_fh, new_sh, new_status, reg_no, date_str),
+                (new_fh, new_sh, new_status, attendance_value, reg_no, date_str),
             )
             updated += 1
 
@@ -3949,8 +4352,8 @@ def _mark_halves_absent_for_day(date_str: str):
             cursor.execute(
                 """
                 INSERT INTO daily_attendance_status
-                  (reg_no, name, dept, date, status, first_half_status, second_half_status, marked_by, marked_at)
-                VALUES (%s, %s, %s, %s, 'Absent', 'Absent', 'Absent', 'System EOD', CURRENT_TIMESTAMP)
+                  (reg_no, name, dept, date, status, first_half_status, second_half_status, attendance_value, marked_by, marked_at)
+                VALUES (%s, %s, %s, %s, 'Absent', 'Absent', 'Absent', 0.0, 'System EOD', CURRENT_TIMESTAMP)
                 ON CONFLICT (reg_no, date) DO NOTHING
             """,
                 (reg_no, name, dept, date_str),
@@ -4143,6 +4546,45 @@ def _run_ddl():
     ]:
         cursor.execute(idx)
 
+    # ── MORNING AND EVENING ATTENDANCE TABLES ─────────────────────────
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS morning_attendance (
+            id SERIAL PRIMARY KEY,
+            reg_no VARCHAR(64) NOT NULL,
+            name VARCHAR(160) NOT NULL,
+            dept VARCHAR(160) NOT NULL,
+            date DATE NOT NULL,
+            in_time TIME,
+            status VARCHAR(20) DEFAULT 'Present',
+            attendance_value DECIMAL(3,2) DEFAULT 0.5,
+            marked_by VARCHAR(120),
+            marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(reg_no, date)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS evening_attendance (
+            id SERIAL PRIMARY KEY,
+            reg_no VARCHAR(64) NOT NULL,
+            name VARCHAR(160) NOT NULL,
+            dept VARCHAR(160) NOT NULL,
+            date DATE NOT NULL,
+            in_time TIME,
+            status VARCHAR(20) DEFAULT 'Present',
+            attendance_value DECIMAL(3,2) DEFAULT 0.5,
+            marked_by VARCHAR(120),
+            marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(reg_no, date)
+        )
+    """)
+    for idx in [
+        "CREATE INDEX IF NOT EXISTS idx_morning_attendance_reg_no ON morning_attendance (reg_no)",
+        "CREATE INDEX IF NOT EXISTS idx_morning_attendance_date ON morning_attendance (date DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_evening_attendance_reg_no ON evening_attendance (reg_no)",
+        "CREATE INDEX IF NOT EXISTS idx_evening_attendance_date ON evening_attendance (date DESC)",
+    ]:
+        cursor.execute(idx)
+
     # Migration columns
     for col_sql in [
         "ALTER TABLE user_latest_locations ADD COLUMN IF NOT EXISTS boundary_warning BOOLEAN DEFAULT FALSE",
@@ -4286,7 +4728,9 @@ def _run_ddl():
         "ALTER TABLE daily_attendance_status ADD COLUMN IF NOT EXISTS first_half_status VARCHAR(20) DEFAULT NULL",
         "ALTER TABLE daily_attendance_status ADD COLUMN IF NOT EXISTS second_half_status VARCHAR(20) DEFAULT NULL",
         "ALTER TABLE daily_attendance_status ADD COLUMN IF NOT EXISTS first_half_in_time TIME DEFAULT NULL",
+        "ALTER TABLE daily_attendance_status ADD COLUMN IF NOT EXISTS first_half_out_time TIME DEFAULT NULL",
         "ALTER TABLE daily_attendance_status ADD COLUMN IF NOT EXISTS second_half_in_time TIME DEFAULT NULL",
+        "ALTER TABLE daily_attendance_status ADD COLUMN IF NOT EXISTS second_half_out_time TIME DEFAULT NULL",
         # slot_half on attendance_duration_settings: 'first_half' | 'second_half' | 'full_day'
         "ALTER TABLE attendance_duration_settings ADD COLUMN IF NOT EXISTS slot_half VARCHAR(20) DEFAULT 'full_day'",
         # Half-day fields on leave_requests
@@ -4308,6 +4752,25 @@ def _run_ddl():
         )
     """)
 
+    # 3. expired_leaves table — stores historical logs of expired leaves (CL, EL, etc.)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS expired_leaves (
+            id SERIAL PRIMARY KEY,
+            reg_no VARCHAR(64) NOT NULL,
+            user_name VARCHAR(160) NOT NULL,
+            dept VARCHAR(160) NOT NULL,
+            role VARCHAR(80) DEFAULT 'staff',
+            leave_type VARCHAR(50) NOT NULL,
+            expired_amount DECIMAL(10, 2) NOT NULL,
+            expiry_date DATE NOT NULL,
+            reason VARCHAR(255) DEFAULT 'System automated expiry',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_expired_leaves_reg_no ON expired_leaves (reg_no)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_expired_leaves_dept ON expired_leaves (dept)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_expired_leaves_expiry_date ON expired_leaves (expiry_date DESC)")
+
     # Initialize default leave settings if not present
     _leave_setting_defaults = {
         "half_day_enabled": "false",
@@ -4316,6 +4779,11 @@ def _run_ddl():
         "cl_monthly_allocation": "1",
         "cl_expiry_date": "",   # empty = no expiry
         "el_expiry_date": "",   # empty = no expiry
+        "auto_expand_checkin_enabled": "true",  # Default enabled for check-in
+        "auto_expand_checkout_enabled": "true", # Default enabled for check-out
+        "auto_expand_fn_minutes": "5",          # Separate extension duration for Forenoon (FN)
+        "auto_expand_an_minutes": "5",          # Separate extension duration for Afternoon (AN)
+        "auto_expand_minutes": "5",             # Default fallback extension
     }
     for _key, _val in _leave_setting_defaults.items():
         cursor.execute("SELECT 1 FROM leave_settings WHERE key = %s", (_key,))
@@ -6886,7 +7354,7 @@ def process_attendance_background(
 
 
 def _attendance_sync_work(
-    reg_no, user_role, form_data, active_slot_type, img_bytes, active_slot=None
+    reg_no, user_role, form_data, active_slot_type, img_bytes, active_slot=None, active_slot_half=None
 ):
     """Run the blocking attendance marking work in a thread pool.
     
@@ -6894,7 +7362,7 @@ def _attendance_sync_work(
     operations extracted from the async endpoint. It runs in a thread pool
     executor to avoid blocking the event loop.
     """
-    return _secure_verify_and_mark(reg_no, img_bytes, user_role, form_data, active_slot_type, active_slot)
+    return _secure_verify_and_mark(reg_no, img_bytes, user_role, form_data, active_slot_type, active_slot, active_slot_half)
 
 
 def get_ccl_settings_for_date(date_str: str = None) -> dict:
@@ -7022,7 +7490,7 @@ async def mark_attendance_secure(
         )
 
     cursor.execute("""
-        SELECT slot_number, start_time, duration_minutes, is_enabled, slot_type
+        SELECT slot_number, start_time, duration_minutes, is_enabled, slot_type, slot_half
         FROM attendance_duration_settings
         WHERE is_enabled = 1
         ORDER BY slot_number ASC
@@ -7031,6 +7499,7 @@ async def mark_attendance_secure(
 
     active_slot = None
     active_slot_type = "check_in"
+    active_slot_half = None  # 'first_half' | 'second_half' | None
 
     if duration_rows:
         current_time = datetime.now()
@@ -7041,17 +7510,20 @@ async def mark_attendance_secure(
             start_time = row[1]
             duration_minutes = row[2]
             slot_type = row[4] if len(row) > 4 and row[4] else "check_in"
+            slot_half = row[5] if len(row) > 5 and row[5] else "full_day"
+            effective_duration, _, _ = _calculate_effective_slot_duration(slot_type, slot_half, duration_minutes)
 
             start_hour, start_minute = map(int, start_time.split(":"))
             start_datetime = current_time.replace(
                 hour=start_hour, minute=start_minute, second=0, microsecond=0
             )
-            end_datetime = start_datetime + timedelta(minutes=duration_minutes)
+            end_datetime = start_datetime + timedelta(minutes=effective_duration)
 
             if start_datetime <= current_time < end_datetime:
                 allowed = True
                 active_slot = slot_number
                 active_slot_type = slot_type
+                active_slot_half = slot_half if slot_half in ("first_half", "second_half") else None
                 break
 
         if not allowed:
@@ -7063,7 +7535,7 @@ async def mark_attendance_secure(
                 
         if not allowed:
             slots_info = ", ".join(
-                [f"Slot {row[0]} ({row[4] if len(row) > 4 and row[4] else 'check_in'}): {row[1]} ({row[2]} min)" for row in duration_rows]
+                [f"Slot {row[0]} ({row[4] if len(row) > 4 and row[4] else 'check_in'} / {row[5] if len(row) > 5 and row[5] else 'full_day'}): {row[1]} ({row[2]} min)" for row in duration_rows]
             )
             raise HTTPException(
                 status_code=403,
@@ -7109,47 +7581,125 @@ async def mark_attendance_secure(
             )
 
         if active_slot is not None:
-            # First, check if they are already marked Present in daily_attendance_status for today
-            cursor.execute(
-                """
-                SELECT COUNT(*) FROM daily_attendance_status
-                WHERE reg_no = ? AND date = ? AND status = 'Present'
-                """,
-                (reg_no, today_str)
-            )
-            is_present_today = cursor.fetchone()[0] > 0
-            
-            # If they are already present today, and this is a check_in attempt, block it
-            if is_present_today and active_slot_type == "check_in":
-                raise HTTPException(
-                    status_code=403,
-                    detail="You are already marked present for today."
+            if active_slot_type == "check_out":
+                cursor.execute(
+                    "SELECT COUNT(*) FROM attendance WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = 'check_in'",
+                    (reg_no,)
                 )
+                cin_count = cursor.fetchone()[0]
+                if cin_count == 0:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM other_staff_attendance WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = 'check_in'",
+                        (reg_no,)
+                    )
+                    cin_count = cursor.fetchone()[0]
+                if cin_count == 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="You cannot Check-Out without checking in first for today."
+                    )
 
-            cursor.execute(
-                """
-                SELECT COUNT(*) FROM attendance 
-                WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = ?
-                """,
-                (reg_no, active_slot_type)
-            )
-            dup_count = cursor.fetchone()[0]
+            _hd_cfg = _get_half_day_settings()
+            _req_fn_checkout = _hd_cfg.get("require_fn_check_out", False)
 
-            if dup_count == 0:
+            if active_slot_half == "first_half":
+                if active_slot_type == "check_out" and not _req_fn_checkout:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Morning (FN) Check-Out is currently cancelled/bypassed by system policy. No check-out scan is required."
+                    )
+
                 cursor.execute(
                     """
-                    SELECT COUNT(*) FROM other_staff_attendance 
+                    SELECT COUNT(*) FROM attendance 
+                    WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = ?
+                    """,
+                    (reg_no, active_slot_type)
+                )
+                dup_count = cursor.fetchone()[0]
+                if dup_count == 0:
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*) FROM other_staff_attendance 
+                        WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = ?
+                        """,
+                        (reg_no, active_slot_type)
+                    )
+                    dup_count = cursor.fetchone()[0]
+
+                if dup_count > 0:
+                    slot_name = "Check-In" if active_slot_type == "check_in" else "Check-Out"
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"You have already marked Morning (FN) {slot_name} attendance for today."
+                    )
+            elif active_slot_half == "second_half":
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM attendance 
+                    WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = ?
+                    """,
+                    (reg_no, active_slot_type)
+                )
+                dup_count = cursor.fetchone()[0]
+                if dup_count == 0:
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*) FROM other_staff_attendance 
+                        WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = ?
+                        """,
+                        (reg_no, active_slot_type)
+                    )
+                    dup_count = cursor.fetchone()[0]
+
+                if dup_count > 0:
+                    slot_name = "Check-In" if active_slot_type == "check_in" else "Check-Out"
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"You have already marked Afternoon (AN) {slot_name} attendance for today."
+                    )
+            else:
+
+                # Legacy full-day mode duplicate check
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM daily_attendance_status
+                    WHERE reg_no = ? AND date = ? AND status = 'Present'
+                    """,
+                    (reg_no, today_str)
+                )
+                is_present_today = cursor.fetchone()[0] > 0
+
+                if is_present_today and active_slot_type == "check_in":
+                    raise HTTPException(
+                        status_code=403,
+                        detail="You are already marked present for today."
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM attendance 
                     WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = ?
                     """,
                     (reg_no, active_slot_type)
                 )
                 dup_count = cursor.fetchone()[0]
 
-            if dup_count > 0:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"You have already marked {active_slot_type.replace('_', ' ')} attendance for today."
-                )
+                if dup_count == 0:
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*) FROM other_staff_attendance 
+                        WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = ?
+                        """,
+                        (reg_no, active_slot_type)
+                    )
+                    dup_count = cursor.fetchone()[0]
+
+                if dup_count > 0:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"You have already marked {active_slot_type.replace('_', ' ')} attendance for today."
+                    )
 
     form_data = None
     try:
@@ -7281,7 +7831,7 @@ async def mark_attendance_secure(
         result = await loop.run_in_executor(
             _cpu_executor,
             _attendance_sync_work,
-            reg_no, user_role, form_data, active_slot_type, img_bytes, active_slot
+            reg_no, user_role, form_data, active_slot_type, img_bytes, active_slot, active_slot_half
         )
         return result
 
@@ -7305,9 +7855,10 @@ def _date_str(val):
 
 
 def _secure_verify_and_mark(
-    reg_no: str, img_bytes: bytes, user_role: str = "staff", form_data=None, slot_type: str = "check_in", active_slot: int = None
+    reg_no: str, img_bytes: bytes, user_role: str = "staff", form_data=None,
+    slot_type: str = "check_in", active_slot: int = None, active_slot_half: str = None
 ):
-    """Internal function for secure verification with identity binding"""
+    """Internal function for secure verification with identity binding."""
     # Check lockout status
     is_locked, remaining = check_lockout(reg_no)
     if is_locked:
@@ -7319,50 +7870,113 @@ def _secure_verify_and_mark(
             detail=f"Account locked due to multiple failed attempts. Try again in {remaining} seconds.",
         )
 
-    # SECURE DOUBLE CHECK: Enforce duplicate check for the active slot type
-    chk_slot_type = slot_type or "check_in"
-    
-    # First, check if they are already marked Present in daily_attendance_status for today
+    # SECURE DOUBLE CHECK: Enforce duplicate check for the active slot
     today_date_str = datetime.now().strftime("%Y-%m-%d")
-    cursor.execute(
-        """
-        SELECT COUNT(*) FROM daily_attendance_status
-        WHERE reg_no = ? AND date = ? AND status = 'Present'
-        """,
-        (reg_no, today_date_str)
-    )
-    is_present_today = cursor.fetchone()[0] > 0
-    
-    if is_present_today and chk_slot_type == "check_in":
-        raise HTTPException(
-            status_code=403,
-            detail="You are already marked present for today."
-        )
 
-    cursor.execute(
-        """
-        SELECT COUNT(*) FROM attendance 
-        WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = ?
-        """,
-        (reg_no, chk_slot_type)
-    )
-    dup_count = cursor.fetchone()[0]
+    if active_slot_half == "first_half":
+        _hd_cfg = _get_half_day_settings()
+        _req_fn_checkout = _hd_cfg.get("require_fn_check_out", False)
+        chk_slot_type = slot_type or "check_in"
+        if chk_slot_type == "check_out" and not _req_fn_checkout:
+            raise HTTPException(
+                status_code=400,
+                detail="Morning (FN) Check-Out is currently cancelled/bypassed by system policy. No check-out scan is required."
+            )
 
-    if dup_count == 0:
         cursor.execute(
             """
-            SELECT COUNT(*) FROM other_staff_attendance 
+            SELECT COUNT(*) FROM attendance 
+            WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = ?
+            """,
+            (reg_no, chk_slot_type)
+        )
+        dup_count = cursor.fetchone()[0]
+        if dup_count == 0:
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM other_staff_attendance 
+                WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = ?
+                """,
+                (reg_no, chk_slot_type)
+            )
+            dup_count = cursor.fetchone()[0]
+
+        if dup_count > 0:
+            slot_name = "Check-In" if chk_slot_type == "check_in" else "Check-Out"
+            raise HTTPException(
+                status_code=403,
+                detail=f"You have already marked Morning (FN) {slot_name} attendance for today."
+            )
+    elif active_slot_half == "second_half":
+        chk_slot_type = slot_type or "check_in"
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM attendance 
+            WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = ?
+            """,
+            (reg_no, chk_slot_type)
+        )
+        dup_count = cursor.fetchone()[0]
+        if dup_count == 0:
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM other_staff_attendance 
+                WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = ?
+                """,
+                (reg_no, chk_slot_type)
+            )
+            dup_count = cursor.fetchone()[0]
+
+        if dup_count > 0:
+            slot_name = "Check-In" if chk_slot_type == "check_in" else "Check-Out"
+            raise HTTPException(
+                status_code=403,
+                detail=f"You have already marked Afternoon (AN) {slot_name} attendance for today."
+            )
+    else:
+
+        # Legacy full-day check_in/check_out mode
+        chk_slot_type = slot_type or "check_in"
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM daily_attendance_status
+            WHERE reg_no = ? AND date = ? AND status = 'Present'
+            """,
+            (reg_no, today_date_str)
+        )
+        is_present_today = cursor.fetchone()[0] > 0
+
+        if is_present_today and chk_slot_type == "check_in":
+            raise HTTPException(
+                status_code=403,
+                detail="You are already marked present for today."
+            )
+
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM attendance 
             WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = ?
             """,
             (reg_no, chk_slot_type)
         )
         dup_count = cursor.fetchone()[0]
 
-    if dup_count > 0:
-        raise HTTPException(
-            status_code=403,
-            detail=f"You have already marked {chk_slot_type.replace('_', ' ')} attendance for today."
-        )
+        if dup_count == 0:
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM other_staff_attendance 
+                WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = ?
+                """,
+                (reg_no, chk_slot_type)
+            )
+            dup_count = cursor.fetchone()[0]
+
+        if dup_count > 0:
+            raise HTTPException(
+                status_code=403,
+                detail=f"You have already marked {chk_slot_type.replace('_', ' ')} attendance for today."
+            )
+
 
     # SECURE DOUBLE CHECK: Enforce geofencing and WiFi checks directly at the validation level
     if form_data:
@@ -7599,28 +8213,18 @@ def _secure_verify_and_mark(
     time_now_str = datetime.now().strftime("%H:%M:%S")
     sync_slot_type = slot_type or "check_in"
 
-    # Determine slot_half for the active slot (if half-day mode is on)
+    # Determine slot_half — use the value passed directly from mark_attendance
+    # (active_slot_half is already resolved from the slot's slot_half column by the caller)
     _hd_settings = _get_half_day_settings()
     _half_day_enabled = _hd_settings["half_day_enabled"]
-    _slot_half = None  # 'first_half' | 'second_half' | None
+    # Use the passed active_slot_half (already resolved by mark_attendance endpoint)
+    _slot_half = active_slot_half  # 'first_half' | 'second_half' | None
 
-    if _half_day_enabled and active_slot and active_slot != -1:
-        try:
-            cursor.execute(
-                "SELECT slot_half FROM attendance_duration_settings WHERE id = %s",
-                (active_slot,),
-            )
-            _slot_row = cursor.fetchone()
-            if _slot_row and _slot_row[0] in ("first_half", "second_half"):
-                _slot_half = _slot_row[0]
-        except Exception:
-            pass
 
     try:
-        # Check if there's already a status record for this user on this date
         cursor.execute(
             """
-            SELECT id, status, leave_type, leave_request_id, first_half_status, second_half_status
+            SELECT id, status, leave_type, leave_request_id, first_half_status, second_half_status, first_half_in_time, second_half_in_time
             FROM daily_attendance_status 
             WHERE reg_no = ? AND date = ?
         """,
@@ -7628,69 +8232,109 @@ def _secure_verify_and_mark(
         )
         existing_status = cursor.fetchone()
 
-        if _half_day_enabled and _slot_half:
+        if _half_day_enabled:
             # ── HALF-DAY MODE ──────────────────────────────────────────────────
-            if existing_status:
-                old_fh = existing_status[4]
-                old_sh = existing_status[5]
-                new_fh = old_fh
-                new_sh = old_sh
+            effective_half = _slot_half
+            if not effective_half:
+                try:
+                    now_time = datetime.now().time()
+                    fh_start = datetime.strptime(_hd_settings.get("first_half_start", "08:30"), "%H:%M").time()
+                    fh_end = datetime.strptime(_hd_settings.get("first_half_end", "13:00"), "%H:%M").time()
+                    sh_start = datetime.strptime(_hd_settings.get("second_half_start", "13:00"), "%H:%M").time()
+                    sh_end = datetime.strptime(_hd_settings.get("second_half_end", "17:30"), "%H:%M").time()
+                    
+                    if fh_start <= now_time <= fh_end:
+                        effective_half = "first_half"
+                    elif sh_start <= now_time <= sh_end:
+                        effective_half = "second_half"
+                    else:
+                        cutoff = datetime.strptime("13:00", "%H:%M").time()
+                        effective_half = "first_half" if now_time < cutoff else "second_half"
+                except Exception:
+                    cutoff = datetime.strptime("13:00", "%H:%M").time()
+                    effective_half = "first_half" if datetime.now().time() < cutoff else "second_half"
 
-                if _slot_half == "first_half":
-                    new_fh = "Present"
-                    update_time_col = "first_half_in_time"
-                else:
-                    new_sh = "Present"
-                    update_time_col = "second_half_in_time"
-
-                new_status = _compute_daily_status(new_fh, new_sh)
-                cursor.execute(
-                    f"""
-                    UPDATE daily_attendance_status
-                    SET first_half_status = ?,
-                        second_half_status = ?,
-                        status = ?,
-                        {update_time_col} = ?,
-                        leave_type = NULL,
-                        leave_request_id = NULL,
-                        marked_by = 'Attendance System',
-                        marked_at = CURRENT_TIMESTAMP
-                    WHERE reg_no = ? AND date = ?
-                """,
-                    (new_fh, new_sh, new_status, time_now_str, reg_no, current_date),
-                )
-            else:
-                # First scan of the day for this user in half-day mode
-                new_fh = "Present" if _slot_half == "first_half" else None
-                new_sh = "Present" if _slot_half == "second_half" else None
-                fh_time = time_now_str if _slot_half == "first_half" else None
-                sh_time = time_now_str if _slot_half == "second_half" else None
-                # If only one half is marked, overall status is 'Half Day' (0.5 present)
-                interim_status = "Half Day"
+            # Insert or update into the correct separate session table
+            if effective_half == "first_half":
                 cursor.execute(
                     """
-                    INSERT INTO daily_attendance_status
-                    (reg_no, name, dept, date, status,
-                     first_half_status, second_half_status,
-                     first_half_in_time, second_half_in_time,
-                     marked_by, marked_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Attendance System', CURRENT_TIMESTAMP)
+                    INSERT INTO morning_attendance (reg_no, name, dept, date, in_time, status, attendance_value, marked_by, marked_at)
+                    VALUES (?, ?, ?, ?, ?, 'Present', 0.5, 'Attendance System', CURRENT_TIMESTAMP)
                     ON CONFLICT (reg_no, date) DO UPDATE SET
-                        first_half_status = COALESCE(EXCLUDED.first_half_status, daily_attendance_status.first_half_status),
-                        second_half_status = COALESCE(EXCLUDED.second_half_status, daily_attendance_status.second_half_status),
-                        first_half_in_time = COALESCE(EXCLUDED.first_half_in_time, daily_attendance_status.first_half_in_time),
-                        second_half_in_time = COALESCE(EXCLUDED.second_half_in_time, daily_attendance_status.second_half_in_time),
-                        status = CASE 
-                            WHEN COALESCE(EXCLUDED.first_half_status, daily_attendance_status.first_half_status) = 'Present' 
-                             AND COALESCE(EXCLUDED.second_half_status, daily_attendance_status.second_half_status) = 'Present' THEN 'Present'
-                            ELSE 'Half Day'
-                        END,
+                        in_time = EXCLUDED.in_time,
+                        status = 'Present',
+                        attendance_value = 0.5,
                         marked_by = 'Attendance System',
                         marked_at = CURRENT_TIMESTAMP
-                """,
-                    (reg_no, name, dept, current_date, interim_status,
-                     new_fh, new_sh, fh_time, sh_time),
+                    """,
+                    (reg_no, name, dept, current_date, time_now_str),
                 )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO evening_attendance (reg_no, name, dept, date, in_time, status, attendance_value, marked_by, marked_at)
+                    VALUES (?, ?, ?, ?, ?, 'Present', 0.5, 'Attendance System', CURRENT_TIMESTAMP)
+                    ON CONFLICT (reg_no, date) DO UPDATE SET
+                        in_time = EXCLUDED.in_time,
+                        status = 'Present',
+                        attendance_value = 0.5,
+                        marked_by = 'Attendance System',
+                        marked_at = CURRENT_TIMESTAMP
+                    """,
+                    (reg_no, name, dept, current_date, time_now_str),
+                )
+
+            # Query current state from both session tables
+            cursor.execute("SELECT status, attendance_value FROM morning_attendance WHERE reg_no = ? AND date = ?", (reg_no, current_date))
+            _m_row = cursor.fetchone()
+            cursor.execute("SELECT status, attendance_value FROM evening_attendance WHERE reg_no = ? AND date = ?", (reg_no, current_date))
+            _e_row = cursor.fetchone()
+
+            new_fh = _m_row[0] if _m_row else None
+            new_sh = _e_row[0] if _e_row else None
+            m_val = float(_m_row[1]) if _m_row and _m_row[1] is not None else 0.0
+            e_val = float(_e_row[1]) if _e_row and _e_row[1] is not None else 0.0
+            attendance_value = m_val + e_val
+
+            new_status = _compute_daily_status(new_fh, new_sh, target_date=current_date)
+            # Determine in_time or out_time based on sync_slot_type
+            fh_in_time = time_now_str if (effective_half == "first_half" and sync_slot_type == "check_in") else (str(existing_status[6]) if existing_status and existing_status[6] else None)
+            fh_out_time = time_now_str if (effective_half == "first_half" and sync_slot_type == "check_out") else None
+            sh_in_time = time_now_str if (effective_half == "second_half" and sync_slot_type == "check_in") else (str(existing_status[7]) if existing_status and existing_status[7] else None)
+            sh_out_time = time_now_str if (effective_half == "second_half" and sync_slot_type == "check_out") else None
+
+            # Keep daily_attendance_status table fully in sync
+            cursor.execute(
+                """
+                INSERT INTO daily_attendance_status
+                (reg_no, name, dept, date, status,
+                 first_half_status, second_half_status,
+                 first_half_in_time, first_half_out_time, second_half_in_time, second_half_out_time,
+                 attendance_value, marked_by, marked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Attendance System', CURRENT_TIMESTAMP)
+                ON CONFLICT (reg_no, date) DO UPDATE SET
+                    first_half_status = EXCLUDED.first_half_status,
+                    second_half_status = EXCLUDED.second_half_status,
+                    first_half_in_time = COALESCE(EXCLUDED.first_half_in_time, daily_attendance_status.first_half_in_time),
+                    first_half_out_time = COALESCE(EXCLUDED.first_half_out_time, daily_attendance_status.first_half_out_time),
+                    second_half_in_time = COALESCE(EXCLUDED.second_half_in_time, daily_attendance_status.second_half_in_time),
+                    second_half_out_time = COALESCE(EXCLUDED.second_half_out_time, daily_attendance_status.second_half_out_time),
+                    status = EXCLUDED.status,
+                    attendance_value = EXCLUDED.attendance_value,
+                    marked_by = 'Attendance System',
+                    marked_at = CURRENT_TIMESTAMP
+                """,
+                (reg_no, name, dept, current_date, new_status, new_fh, new_sh, fh_in_time, fh_out_time, sh_in_time, sh_out_time, attendance_value)
+            )
+
+
+            # Log attendance with value
+            log_audit_event(
+                "ATTENDANCE_MARKED",
+                reg_no,
+                True,
+                f"Attendance marked via {sync_slot_type} in {effective_half}. Value: {attendance_value}"
+            )
         else:
             # ── LEGACY CHECK_IN / CHECK_OUT MODE ───────────────────────────────
             if existing_status:
@@ -7701,7 +8345,7 @@ def _secure_verify_and_mark(
                     cursor.execute(
                         """
                         UPDATE daily_attendance_status 
-                        SET status = 'Present', in_time = ?, leave_type = NULL, leave_request_id = NULL,
+                        SET status = 'Present', in_time = ?, attendance_value = 1.0, leave_type = NULL, leave_request_id = NULL,
                             marked_by = 'Attendance System', marked_at = CURRENT_TIMESTAMP
                         WHERE reg_no = ? AND date = ?
                     """,
@@ -7712,7 +8356,7 @@ def _secure_verify_and_mark(
                     cursor.execute(
                         """
                         UPDATE daily_attendance_status 
-                        SET status = 'Present', out_time = ?, leave_type = NULL, leave_request_id = NULL,
+                        SET status = 'Present', out_time = ?, attendance_value = 1.0, leave_type = NULL, leave_request_id = NULL,
                             marked_by = 'Attendance System', marked_at = CURRENT_TIMESTAMP
                         WHERE reg_no = ? AND date = ?
                     """,
@@ -7723,7 +8367,7 @@ def _secure_verify_and_mark(
                     "ATTENDANCE_OVERRIDE",
                     reg_no,
                     True,
-                    f"User status updated to {new_status} via {sync_slot_type}.",
+                    f"User status updated to {new_status} via {sync_slot_type}. Value: 1.0",
                 )
             else:
                 # No record exists — insert with status 'Present'
@@ -7731,11 +8375,12 @@ def _secure_verify_and_mark(
                     cursor.execute(
                         """
                         INSERT INTO daily_attendance_status 
-                        (reg_no, name, dept, date, status, in_time, marked_by, marked_at)
-                        VALUES (?, ?, ?, ?, 'Present', ?, 'Attendance System', CURRENT_TIMESTAMP)
+                        (reg_no, name, dept, date, status, in_time, attendance_value, marked_by, marked_at)
+                        VALUES (?, ?, ?, ?, 'Present', ?, 1.0, 'Attendance System', CURRENT_TIMESTAMP)
                         ON CONFLICT (reg_no, date) DO UPDATE SET
                             status = 'Present',
                             in_time = COALESCE(daily_attendance_status.in_time, EXCLUDED.in_time),
+                            attendance_value = 1.0,
                             marked_by = 'Attendance System',
                             marked_at = CURRENT_TIMESTAMP
                     """,
@@ -7745,16 +8390,25 @@ def _secure_verify_and_mark(
                     cursor.execute(
                         """
                         INSERT INTO daily_attendance_status 
-                        (reg_no, name, dept, date, status, out_time, marked_by, marked_at)
-                        VALUES (?, ?, ?, ?, 'Present', ?, 'Attendance System', CURRENT_TIMESTAMP)
+                        (reg_no, name, dept, date, status, out_time, attendance_value, marked_by, marked_at)
+                        VALUES (?, ?, ?, ?, 'Present', ?, 1.0, 'Attendance System', CURRENT_TIMESTAMP)
                         ON CONFLICT (reg_no, date) DO UPDATE SET
                             status = 'Present',
                             out_time = COALESCE(daily_attendance_status.out_time, EXCLUDED.out_time),
+                            attendance_value = 1.0,
                             marked_by = 'Attendance System',
                             marked_at = CURRENT_TIMESTAMP
                     """,
                         (reg_no, name, dept, current_date, time_now_str),
                     )
+                
+                # Log attendance with value
+                log_audit_event(
+                    "ATTENDANCE_MARKED",
+                    reg_no,
+                    True,
+                    f"First attendance of the day via {sync_slot_type}. Value: 1.0"
+                )
     except Exception as e:
         print(f"Error syncing daily_attendance_status for {reg_no}: {e}")
 
@@ -7762,8 +8416,6 @@ def _secure_verify_and_mark(
 
     if is_ccl_scan:
         log_audit_event("CCL_EARNED_SCAN", reg_no, True, f"Confidence: {confidence:.3f}")
-    else:
-        log_audit_event("ATTENDANCE_MARKED", reg_no, True, f"Confidence: {confidence:.3f}")
 
     # Update user location when attendance is marked successfully
     if form_data is not None:
@@ -7911,8 +8563,19 @@ def _secure_verify_and_mark(
 
     if is_ccl_scan:
         msg = "You earned 1.0 CCL point! (Leave balance updated)" if earned_ccl else "You have already earned your CCL point for today."
+        session_label = ""
+    elif _slot_half == "first_half":
+        session_label = "FN (Morning)"
+        msg = f"FN Attendance marked successfully — 0.5 credited. You earned 1.0 CCL point!" if earned_ccl else f"FN (Morning) attendance marked successfully — 0.5 credited"
+    elif _slot_half == "second_half":
+        session_label = "AN (Afternoon)"
+        msg = f"AN Attendance marked successfully — 0.5 credited. You earned 1.0 CCL point!" if earned_ccl else f"AN (Afternoon) attendance marked successfully — 0.5 credited"
     else:
+        session_label = ""
         msg = "Attendance marked successfully. You earned 1.0 CCL point!" if earned_ccl else "Attendance marked successfully"
+
+    # Compute the attendance_value for the response
+    _resp_attendance_value = 0.5 if _slot_half in ("first_half", "second_half") else 1.0
 
     return {
         "message": msg,
@@ -7923,6 +8586,9 @@ def _secure_verify_and_mark(
         "confidence": float(round(confidence, 3)),
         "verification_status": "verified",
         "bbox": [float(x) for x in face.bbox],
+        "session": _slot_half or "full_day",
+        "session_label": session_label,
+        "attendance_value": _resp_attendance_value,
     }
 
 
@@ -7938,7 +8604,7 @@ async def admin_mark_attendance(request: Request, image: UploadFile = File(...))
     The admin's reg_no is automatically extracted from their authentication token.
     """
     cursor.execute("""
-        SELECT slot_number, start_time, duration_minutes, is_enabled, slot_type
+        SELECT slot_number, start_time, duration_minutes, is_enabled, slot_type, slot_half
         FROM attendance_duration_settings
         WHERE is_enabled = 1
         ORDER BY slot_number ASC
@@ -7946,6 +8612,7 @@ async def admin_mark_attendance(request: Request, image: UploadFile = File(...))
     duration_rows = cursor.fetchall()
 
     active_slot_type = "check_in"
+    active_slot_half = None
     if duration_rows:
         current_time = datetime.now()
         allowed = False
@@ -7955,16 +8622,19 @@ async def admin_mark_attendance(request: Request, image: UploadFile = File(...))
             start_time = row[1]
             duration_minutes = row[2]
             slot_type = row[4] if len(row) > 4 and row[4] else "check_in"
+            slot_half = row[5] if len(row) > 5 and row[5] else "full_day"
+            effective_duration, _, _ = _calculate_effective_slot_duration(slot_type, slot_half, duration_minutes)
 
             start_hour, start_minute = map(int, start_time.split(":"))
             start_datetime = current_time.replace(
                 hour=start_hour, minute=start_minute, second=0, microsecond=0
             )
-            end_datetime = start_datetime + timedelta(minutes=duration_minutes)
+            end_datetime = start_datetime + timedelta(minutes=effective_duration)
 
             if start_datetime <= current_time < end_datetime:
                 allowed = True
                 active_slot_type = slot_type
+                active_slot_half = slot_half if slot_half in ("first_half", "second_half") else None
                 break
 
         if not allowed:
@@ -8008,6 +8678,17 @@ async def admin_mark_attendance(request: Request, image: UploadFile = File(...))
             detail=f"Too many requests. Please wait {retry_after} seconds before trying again.",
         )
 
+    if active_slot_type == "check_out":
+        cursor.execute(
+            "SELECT COUNT(*) FROM attendance WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = 'check_in'",
+            (reg_no,)
+        )
+        if cursor.fetchone()[0] == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot Check-Out without checking in first for today."
+            )
+
     # Enforce geofencing using parsed parameters
     try:
         form_data = await request.form()
@@ -8044,7 +8725,7 @@ async def admin_mark_attendance(request: Request, image: UploadFile = File(...))
         return await loop.run_in_executor(
             _cpu_executor,
             _attendance_sync_work,
-            reg_no, "admin", validation_form, active_slot_type, img_bytes
+            reg_no, "admin", validation_form, active_slot_type, img_bytes, None, active_slot_half
         )
 
 
@@ -8055,7 +8736,7 @@ async def hod_mark_attendance(request: Request, image: UploadFile = File(...)):
     The HOD's reg_no is automatically extracted from their authentication token.
     """
     cursor.execute("""
-        SELECT slot_number, start_time, duration_minutes, is_enabled, slot_type
+        SELECT slot_number, start_time, duration_minutes, is_enabled, slot_type, slot_half
         FROM attendance_duration_settings
         WHERE is_enabled = 1
         ORDER BY slot_number ASC
@@ -8063,6 +8744,7 @@ async def hod_mark_attendance(request: Request, image: UploadFile = File(...)):
     duration_rows = cursor.fetchall()
 
     active_slot_type = "check_in"
+    active_slot_half = None
     if duration_rows:
         current_time = datetime.now()
         allowed = False
@@ -8072,16 +8754,19 @@ async def hod_mark_attendance(request: Request, image: UploadFile = File(...)):
             start_time = row[1]
             duration_minutes = row[2]
             slot_type = row[4] if len(row) > 4 and row[4] else "check_in"
+            slot_half = row[5] if len(row) > 5 and row[5] else "full_day"
+            effective_duration, _, _ = _calculate_effective_slot_duration(slot_type, slot_half, duration_minutes)
 
             start_hour, start_minute = map(int, start_time.split(":"))
             start_datetime = current_time.replace(
                 hour=start_hour, minute=start_minute, second=0, microsecond=0
             )
-            end_datetime = start_datetime + timedelta(minutes=duration_minutes)
+            end_datetime = start_datetime + timedelta(minutes=effective_duration)
 
             if start_datetime <= current_time < end_datetime:
                 allowed = True
                 active_slot_type = slot_type
+                active_slot_half = slot_half if slot_half in ("first_half", "second_half") else None
                 break
 
         if not allowed:
@@ -8125,6 +8810,17 @@ async def hod_mark_attendance(request: Request, image: UploadFile = File(...)):
             detail=f"Too many requests. Please wait {retry_after} seconds before trying again.",
         )
 
+    if active_slot_type == "check_out":
+        cursor.execute(
+            "SELECT COUNT(*) FROM attendance WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = 'check_in'",
+            (reg_no,)
+        )
+        if cursor.fetchone()[0] == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot Check-Out without checking in first for today."
+            )
+
     # Enforce geofencing using parsed parameters
     try:
         form_data = await request.form()
@@ -8161,7 +8857,7 @@ async def hod_mark_attendance(request: Request, image: UploadFile = File(...)):
         return await loop.run_in_executor(
             _cpu_executor,
             _attendance_sync_work,
-            reg_no, "hod", validation_form, active_slot_type, img_bytes
+            reg_no, "hod", validation_form, active_slot_type, img_bytes, None, active_slot_half
         )
 
 
@@ -8531,7 +9227,7 @@ async def admin_dashboard(request: Request):
     # Get recent attendance (face scan + OD)
     try:
         cursor.execute("""
-            SELECT id, reg_no, name, dept, timestamp, 'face_scan' as source
+            SELECT id, reg_no, name, dept, timestamp, 'face_scan' as source, status
             FROM attendance
             ORDER BY timestamp DESC
             LIMIT 8
@@ -8539,7 +9235,7 @@ async def admin_dashboard(request: Request):
         face_scan_attendance = cursor.fetchall()
 
         cursor.execute("""
-            SELECT id, reg_no, name, dept, date as timestamp, 'od' as source
+            SELECT id, reg_no, name, dept, date as timestamp, 'od' as source, NULL as status
             FROM daily_attendance_status
             WHERE date::date = CURRENT_DATE AND status = 'Present' AND leave_type IN ('od', 'earned', 'casual')
             ORDER BY date DESC
@@ -8554,7 +9250,7 @@ async def admin_dashboard(request: Request):
     except Exception as e:
         print(f"Error getting combined attendance: {e}")
         cursor.execute("""
-            SELECT id, reg_no, name, dept, timestamp, 'attendance' as source
+            SELECT id, reg_no, name, dept, timestamp, 'attendance' as source, status
             FROM attendance 
             ORDER BY id DESC 
             LIMIT 10
@@ -8601,6 +9297,8 @@ async def admin_dashboard(request: Request):
                 "dept": row[3],
                 "timestamp": _ts(row[4]) if row[4] else str(row[4]),
                 "source": row[5],
+                "status": _format_scan_status(row[6] if len(row) > 6 else None, row[4]) if row[5] == "face_scan" else None,
+                "punch_type": (row[6] or "check_in") if row[5] == "face_scan" and len(row) > 6 else None,
             }
             for row in recent_attendance
         ],
@@ -8629,7 +9327,7 @@ async def admin_recent_attendance(request: Request):
         # Get face scan attendance
         cursor.execute("""
             SELECT id, reg_no, name, dept, timestamp, 'face_scan' as source,
-                   NULL as leave_type, NULL as processed_date, 'Present' as status, NULL as absent_reason
+                   NULL as leave_type, NULL as processed_date, status, NULL as absent_reason
             FROM attendance
             ORDER BY timestamp DESC
             LIMIT 10
@@ -8683,6 +9381,7 @@ async def admin_recent_attendance(request: Request):
     # Build recent_attendance list based on the combined data
     recent_attendance_list = []
     for row in recent_attendance:
+        raw_punch = row[8] if row[5] == "face_scan" else None
         recent_attendance_list.append(
             {
                 "id": row[0],
@@ -8693,7 +9392,8 @@ async def admin_recent_attendance(request: Request):
                 "source": row[5],
                 "leave_type": row[6],
                 "approval_date": _ts(row[7]) if row[7] else None,
-                "status": row[8],
+                "status": _format_scan_status(row[8], row[4]) if row[5] == "face_scan" else row[8],
+                "punch_type": raw_punch or ("check_in" if row[5] == "face_scan" else None),
                 "absent_reason": row[9],
             }
         )
@@ -10646,7 +11346,7 @@ async def admin_get_attendance(request: Request, date: str = None, limit: int = 
             # Uses idx_attendance_timestamp index (partial match)
             cursor.execute(
                 """
-                SELECT id, reg_no, name, dept, class_div, timestamp
+                SELECT id, reg_no, name, dept, class_div, timestamp, status
                 FROM attendance
                 WHERE timestamp::date = ?
                 ORDER BY timestamp DESC
@@ -10657,7 +11357,7 @@ async def admin_get_attendance(request: Request, date: str = None, limit: int = 
         else:
             # Uses idx_attendance_timestamp index for ordering
             cursor.execute("""
-                SELECT id, reg_no, name, dept, class_div, timestamp
+                SELECT id, reg_no, name, dept, class_div, timestamp, status
                 FROM attendance
                 ORDER BY timestamp DESC
                 LIMIT ?
@@ -10673,6 +11373,7 @@ async def admin_get_attendance(request: Request, date: str = None, limit: int = 
                     "dept": row[3],
                     "class_div": row[4] or "",
                     "timestamp": _ts(row[5]),
+                    "status": _format_scan_status(row[6], row[5]),
                 }
                 for row in rows
             ],
@@ -10698,7 +11399,7 @@ async def admin_get_staff_attendance(
 
     try:
         query_parts = [
-            "SELECT a.id, a.reg_no, a.name, a.dept, a.class_div, a.timestamp "
+            "SELECT a.id, a.reg_no, a.name, a.dept, a.class_div, a.timestamp, a.status "
         ]
         query_parts.append("FROM attendance a")
         conditions = []
@@ -10755,6 +11456,7 @@ async def admin_get_staff_attendance(
                         "dept": row[3],
                         "class_div": row[4] or "",
                         "timestamp": _ts(row[5]),
+                        "status": _format_scan_status(row[6], row[5]),
                         "role": user_roles.get(reg_no_val),
                     }
                 )
@@ -11811,7 +12513,7 @@ async def hod_dashboard(request: Request):
     # Get recent attendance for this department (face scan + OD)
     cursor.execute(
         """
-        SELECT id, reg_no, name, dept, class_div, timestamp, 'face_scan' as source
+        SELECT id, reg_no, name, dept, class_div, timestamp, 'face_scan' as source, status
         FROM attendance 
         WHERE dept = ? 
         ORDER BY id DESC 
@@ -11877,6 +12579,7 @@ async def hod_dashboard(request: Request):
             )
         else:
             # Face scan record
+            raw_status = row[7] if len(row) > 7 else None
             recent_attendance_list.append(
                 {
                     "id": row[0],
@@ -11890,7 +12593,9 @@ async def hod_dashboard(request: Request):
                     if len(row) > 5
                     else "",
                     "source": row[6] if len(row) > 6 else "face_scan",
-                    "leave_type": row[7] if len(row) > 7 else None,
+                    "leave_type": None,
+                    "status": _format_scan_status(raw_status, row[5] if len(row) > 5 else None),
+                    "punch_type": raw_status or "check_in",
                 }
             )
 
@@ -11986,7 +12691,7 @@ async def hod_get_attendance(request: Request, date: str = None):
                     "dept": row[3],
                     "class_div": row[4] or "",
                     "timestamp": _ts(row[5]),
-                    "status": row[6] if len(row) > 6 and row[6] else "check_in",
+                    "status": _format_scan_status(row[6], row[5]),
                 }
                 for row in rows
             ],
@@ -12008,7 +12713,7 @@ async def hod_get_staff_attendance(request: Request, date: str = None):
         if date:
             cursor.execute(
                 """
-                SELECT a.id, a.reg_no, a.name, a.dept, a.timestamp 
+                SELECT a.id, a.reg_no, a.name, a.dept, a.timestamp, a.status 
                 FROM attendance a
                 WHERE a.dept = ? AND a.timestamp::date = ?
                 ORDER BY a.id DESC
@@ -12018,7 +12723,7 @@ async def hod_get_staff_attendance(request: Request, date: str = None):
         else:
             cursor.execute(
                 """
-                SELECT a.id, a.reg_no, a.name, a.dept, a.timestamp 
+                SELECT a.id, a.reg_no, a.name, a.dept, a.timestamp, a.status 
                 FROM attendance a
                 WHERE a.dept = ?
                 ORDER BY a.id DESC
@@ -12045,6 +12750,7 @@ async def hod_get_staff_attendance(request: Request, date: str = None):
                         "name": row[2],
                         "dept": row[3],
                         "timestamp": _ts(row[4]),
+                        "status": _format_scan_status(row[5], row[4]),
                         "role": user_roles.get(reg_no),
                     }
                 )
@@ -14088,7 +14794,7 @@ async def submit_leave_request(request: Request):
     try:
         data = await request.json()
 
-        user = verify_user_token(request)
+        user = verify_any_user_token(request)
 
         leave_type = data.get("leave_type")
         start_date = data.get("start_date")
@@ -14874,37 +15580,44 @@ async def admin_approve_leave_request(request: Request, request_id: int):
                 new_fh = "Leave" if which_half == "first" else cur_fh
                 new_sh = "Leave" if which_half == "second" else cur_sh
                 new_overall = _compute_daily_status(new_fh, new_sh)
+                # Calculate attendance value (leave doesn't count as present)
+                attendance_value = _compute_attendance_value_from_halves(new_fh, new_sh)
 
                 cursor.execute(
                     """
                     INSERT INTO daily_attendance_status
                     (reg_no, name, dept, date, status,
                      first_half_status, second_half_status,
-                     leave_request_id, leave_type, marked_by)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     attendance_value, leave_request_id, leave_type, marked_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (reg_no, date) DO UPDATE SET
                         status = EXCLUDED.status,
                         first_half_status = EXCLUDED.first_half_status,
                         second_half_status = EXCLUDED.second_half_status,
+                        attendance_value = EXCLUDED.attendance_value,
                         leave_request_id = EXCLUDED.leave_request_id,
                         leave_type = EXCLUDED.leave_type,
                         marked_by = EXCLUDED.marked_by
                 """,
                     (
                         user_reg_no, user_name, dept, date_str,
-                        new_overall, new_fh, new_sh,
+                        new_overall, new_fh, new_sh, attendance_value,
                         request_id, status_tag, admin_user["name"],
                     ),
                 )
             else:
                 # ── FULL-DAY LEAVE APPROVAL ────────────────────────────────────
+                # Calculate attendance value for full-day leave
+                attendance_value = 0.0 if attendance_status == "Leave" else 1.0
+                
                 cursor.execute(
                     """
                     INSERT INTO daily_attendance_status 
-                    (reg_no, name, dept, date, status, leave_request_id, leave_type, marked_by)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    (reg_no, name, dept, date, status, attendance_value, leave_request_id, leave_type, marked_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (reg_no, date) DO UPDATE SET
                         status = EXCLUDED.status,
+                        attendance_value = EXCLUDED.attendance_value,
                         leave_request_id = EXCLUDED.leave_request_id,
                         leave_type = EXCLUDED.leave_type,
                         marked_by = EXCLUDED.marked_by
@@ -14915,6 +15628,7 @@ async def admin_approve_leave_request(request: Request, request_id: int):
                         dept,
                         date_str,
                         attendance_status,
+                        attendance_value,
                         request_id,
                         status_tag,
                         admin_user["name"],
@@ -15264,75 +15978,150 @@ async def admin_sync_daily_attendance_status(request: Request, date: str = None)
     verify_admin_token(request)
 
     try:
+        _hd_settings = _get_half_day_settings()
+        # 1) Get all scans from attendance table
         if date:
             cursor.execute(
                 """
-                SELECT DISTINCT reg_no, name, dept, timestamp::date as att_date
+                SELECT reg_no, name, dept, timestamp, status
                 FROM attendance
-                WHERE timestamp::date = %s
+                WHERE timestamp::date = ?
                 """,
                 (date,),
             )
         else:
             cursor.execute(
                 """
-                SELECT DISTINCT reg_no, name, dept, timestamp::date as att_date
+                SELECT reg_no, name, dept, timestamp, status
                 FROM attendance
                 """
             )
-        att_rows = cursor.fetchall()
+        att_scans = cursor.fetchall()
 
+        # 2) Get all scans from other_staff_attendance table
+        if date:
+            cursor.execute(
+                """
+                SELECT reg_no, name, dept, timestamp, status
+                FROM other_staff_attendance
+                WHERE timestamp::date = ?
+                """,
+                (date,),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT reg_no, name, dept, timestamp, status
+                FROM other_staff_attendance
+                """
+            )
+        osa_scans = cursor.fetchall()
+
+        all_scans = att_scans + osa_scans
+        
+        # Process unique (reg_no, date) pairs
+        processed_pairs = set()
         synced = 0
-        for reg_no, name, dept, att_date in att_rows:
-            date_str = str(att_date)
+        
+        for reg_no, name, dept, timestamp, status in all_scans:
+            if not timestamp:
+                continue
+            if hasattr(timestamp, "date"):
+                scan_date = timestamp.date()
+                scan_time_str = timestamp.time().strftime("%H:%M:%S")
+            else:
+                ts_str = str(timestamp)
+                date_str = ts_str.split("T")[0] if "T" in ts_str else ts_str.split(" ")[0]
+                scan_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                scan_time_str = ts_str.split("T")[1] if "T" in ts_str else ts_str.split(" ")[1] if " " in ts_str else "09:00:00"
+
+            scan_date_str = str(scan_date)
+            
+            # Determine effective half based on the configured FN/AN boundary
+            try:
+                fh_end_str = _hd_settings.get("first_half_end", "13:00")
+                fh_end_time = datetime.strptime(fh_end_str, "%H:%M").time()
+                
+                scan_time = datetime.strptime(scan_time_str, "%H:%M:%S").time()
+                effective_half = "first_half" if scan_time <= fh_end_time else "second_half"
+            except Exception:
+                effective_half = "first_half"
+
+            # Insert/update in separate morning/evening table
+            if effective_half == "first_half":
+                cursor.execute(
+                    """
+                    INSERT INTO morning_attendance (reg_no, name, dept, date, in_time, status, attendance_value, marked_by, marked_at)
+                    VALUES (?, ?, ?, ?, ?, 'Present', 0.5, 'Sync', CURRENT_TIMESTAMP)
+                    ON CONFLICT (reg_no, date) DO UPDATE SET
+                        in_time = COALESCE(morning_attendance.in_time, EXCLUDED.in_time),
+                        status = 'Present',
+                        attendance_value = 0.5,
+                        marked_by = 'Sync',
+                        marked_at = CURRENT_TIMESTAMP
+                    """,
+                    (reg_no, name, dept, scan_date_str, scan_time_str),
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO evening_attendance (reg_no, name, dept, date, in_time, status, attendance_value, marked_by, marked_at)
+                    VALUES (?, ?, ?, ?, ?, 'Present', 0.5, 'Sync', CURRENT_TIMESTAMP)
+                    ON CONFLICT (reg_no, date) DO UPDATE SET
+                        in_time = COALESCE(evening_attendance.in_time, EXCLUDED.in_time),
+                        status = 'Present',
+                        attendance_value = 0.5,
+                        marked_by = 'Sync',
+                        marked_at = CURRENT_TIMESTAMP
+                    """,
+                    (reg_no, name, dept, scan_date_str, scan_time_str),
+                )
+            
+            processed_pairs.add((reg_no, scan_date_str))
+
+        # 3) Synchronize aggregated records into daily_attendance_status
+        for r_no, d_str in processed_pairs:
+            # Query current state from both session tables
+            cursor.execute("SELECT status, attendance_value, in_time FROM morning_attendance WHERE reg_no = ? AND date = ?", (r_no, d_str))
+            _m_row = cursor.fetchone()
+            cursor.execute("SELECT status, attendance_value, in_time FROM evening_attendance WHERE reg_no = ? AND date = ?", (r_no, d_str))
+            _e_row = cursor.fetchone()
+
+            new_fh = _m_row[0] if _m_row else None
+            new_sh = _e_row[0] if _e_row else None
+            m_val = float(_m_row[1]) if _m_row and _m_row[1] is not None else 0.0
+            e_val = float(_e_row[1]) if _e_row and _e_row[1] is not None else 0.0
+            attendance_value = m_val + e_val
+
+            new_status = _compute_daily_status(new_fh, new_sh, target_date=d_str)
+            fh_time = _m_row[2] if _m_row else None
+            sh_time = _e_row[2] if _e_row else None
+
+            # Get user info
+            cursor.execute("SELECT name, dept FROM users WHERE reg_no = ? UNION ALL SELECT name, dept FROM other_staff WHERE reg_no = ?", (r_no, r_no))
+            user_row = cursor.fetchone()
+            u_name = user_row[0] if user_row else "Unknown"
+            u_dept = user_row[1] if user_row else "Unknown"
+
             cursor.execute(
                 """
-                INSERT INTO daily_attendance_status 
-                (reg_no, name, dept, date, status, marked_by, marked_at)
-                VALUES (%s, %s, %s, %s, 'Present', 'Sync', CURRENT_TIMESTAMP)
+                INSERT INTO daily_attendance_status
+                (reg_no, name, dept, date, status,
+                 first_half_status, second_half_status,
+                 first_half_in_time, second_half_in_time,
+                 attendance_value, marked_by, marked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Sync', CURRENT_TIMESTAMP)
                 ON CONFLICT (reg_no, date) DO UPDATE SET
-                    status = 'Present',
+                    first_half_status = EXCLUDED.first_half_status,
+                    second_half_status = EXCLUDED.second_half_status,
+                    first_half_in_time = COALESCE(EXCLUDED.first_half_in_time, daily_attendance_status.first_half_in_time),
+                    second_half_in_time = COALESCE(EXCLUDED.second_half_in_time, daily_attendance_status.second_half_in_time),
+                    status = EXCLUDED.status,
+                    attendance_value = EXCLUDED.attendance_value,
                     marked_by = 'Sync',
                     marked_at = CURRENT_TIMESTAMP
-            """,
-                (reg_no, name, dept, date_str),
-            )
-            synced += 1
-
-        conn.commit()
-
-        # Also sync other_staff_attendance
-        if date:
-            cursor.execute(
-                """
-                SELECT DISTINCT reg_no, name, dept, timestamp::date as att_date
-                FROM other_staff_attendance
-                WHERE timestamp::date = %s
                 """,
-                (date,),
-            )
-        else:
-            cursor.execute(
-                """
-                SELECT DISTINCT reg_no, name, dept, timestamp::date as att_date
-                FROM other_staff_attendance
-                """
-            )
-        osa_rows = cursor.fetchall()
-
-        for reg_no, name, dept, att_date in osa_rows:
-            date_str = str(att_date)
-            cursor.execute(
-                """
-                INSERT INTO daily_attendance_status 
-                (reg_no, name, dept, date, status, marked_by, marked_at)
-                VALUES (%s, %s, %s, %s, 'Present', 'Sync', CURRENT_TIMESTAMP)
-                ON CONFLICT (reg_no, date) DO UPDATE SET
-                    status = 'Present',
-                    marked_by = 'Sync',
-                    marked_at = CURRENT_TIMESTAMP
-            """,
-                (reg_no, name, dept, date_str),
+                (r_no, u_name, u_dept, d_str, new_status, new_fh, new_sh, fh_time, sh_time, attendance_value)
             )
             synced += 1
 
@@ -15340,12 +16129,12 @@ async def admin_sync_daily_attendance_status(request: Request, date: str = None)
 
         return {
             "success": True,
-            "message": f"Synced {synced} records into daily_attendance_status",
+            "message": f"Successfully processed scans and synced {synced} daily status records.",
             "synced_count": synced,
         }
     except Exception as e:
         print(f"Error syncing daily attendance status: {e}")
-        raise HTTPException(status_code=500, detail="Failed to sync daily status")
+        raise HTTPException(status_code=500, detail=f"Failed to sync daily status: {str(e)}")
 
 
 @app.get("/admin/attendance/daily-status")
@@ -15425,7 +16214,8 @@ async def admin_get_daily_attendance_status(
 
         # Get existing daily_attendance_status records for the date range
         status_query = """
-            SELECT reg_no, name, dept, date, status, leave_request_id, leave_type, marked_by, marked_at, absent_reason
+            SELECT reg_no, name, dept, date, status, leave_request_id, leave_type, marked_by, marked_at, absent_reason,
+                   first_half_status, second_half_status, first_half_in_time, first_half_out_time, second_half_in_time, second_half_out_time, attendance_value
             FROM daily_attendance_status
             WHERE date >= ? AND date <= ?
         """
@@ -15455,7 +16245,15 @@ async def admin_get_daily_attendance_status(
                 "marked_by": row[7],
                 "marked_at": _ts(row[8]),
                 "absent_reason": row[9] if len(row) > 9 else None,
+                "first_half_status": row[10] if len(row) > 10 else None,
+                "second_half_status": row[11] if len(row) > 11 else None,
+                "first_half_in_time": str(row[12]) if len(row) > 12 and row[12] else None,
+                "first_half_out_time": str(row[13]) if len(row) > 13 and row[13] else None,
+                "second_half_in_time": str(row[14]) if len(row) > 14 and row[14] else None,
+                "second_half_out_time": str(row[15]) if len(row) > 15 and row[15] else None,
+                "attendance_value": float(row[16]) if len(row) > 16 and row[16] is not None else None,
             }
+
 
         # Generate results: only return records that exist (no synthetic Absent)
         results = list(status_map.values())
@@ -15926,7 +16724,7 @@ async def staff_dashboard(request: Request):
     # Get recent attendance (face scan + OD records with approval date)
     cursor.execute(
         """
-        SELECT id, reg_no, name, dept, class_div, timestamp, 'face_scan' as source
+        SELECT id, reg_no, name, dept, class_div, timestamp, 'face_scan' as source, status
         FROM attendance 
         WHERE reg_no = %s 
         ORDER BY id DESC 
@@ -15960,7 +16758,7 @@ async def staff_dashboard(request: Request):
     # Build recent_attendance list with approval_date
     recent_attendance_list = []
     for row in recent_attendance:
-        if len(row) >= 8:
+        if len(row) >= 9: # Has status and leave_type
             # OD record with approval date
             recent_attendance_list.append(
                 {
@@ -15977,6 +16775,7 @@ async def staff_dashboard(request: Request):
             )
         else:
             # Face scan record
+            raw_status = row[7] if len(row) > 7 else None
             recent_attendance_list.append(
                 {
                     "id": row[0],
@@ -15990,7 +16789,9 @@ async def staff_dashboard(request: Request):
                     if len(row) > 5
                     else "",
                     "source": row[6] if len(row) > 6 else "face_scan",
-                    "leave_type": row[7] if len(row) > 7 else None,
+                    "status": _format_scan_status(raw_status, row[5]) if raw_status else "Present",
+                    "punch_type": raw_status or "check_in",
+                    "leave_type": None,
                 }
             )
 
@@ -16144,7 +16945,8 @@ async def get_personal_attendance_log(
         # 2) Get daily_attendance_status (OD, Leave, Absent)
         cursor.execute(
             """
-            SELECT date, status, leave_type, absent_reason
+            SELECT date, status, leave_type, absent_reason,
+                   first_half_status, second_half_status, first_half_in_time, first_half_out_time, second_half_in_time, second_half_out_time, attendance_value
             FROM daily_attendance_status
             WHERE reg_no = ? AND date::date >= ? AND date::date <= ?
             """,
@@ -16158,6 +16960,13 @@ async def get_personal_attendance_log(
                 "status": row[1],
                 "leave_type": row[2],
                 "absent_reason": row[3],
+                "first_half_status": row[4],
+                "second_half_status": row[5],
+                "first_half_in_time": str(row[6]) if row[6] else None,
+                "first_half_out_time": str(row[7]) if row[7] else None,
+                "second_half_in_time": str(row[8]) if row[8] else None,
+                "second_half_out_time": str(row[9]) if row[9] else None,
+                "attendance_value": float(row[10]) if row[10] is not None else None,
             }
 
         scan_dates = set()
@@ -16174,15 +16983,31 @@ async def get_personal_attendance_log(
                 if date_str:
                     scan_dates.add(date_str)
             
-            day_status = row[5] if row[5] else "check_in"
+            raw_punch_type = row[5] if row[5] else "check_in"  # check_in or check_out
+            day_status = "Present"  # default daily status
             absent_reason = None
+            day_leave_type = None
+            day_first_half_status = None
+            day_second_half_status = None
+            day_first_half_in_time = None
+            day_first_half_out_time = None
+            day_second_half_in_time = None
+            day_second_half_out_time = None
+            day_attendance_value = None
+
             if date_str in status_map:
                 daily_info = status_map[date_str]
+                day_status = daily_info["status"] or "Present"
+                day_leave_type = daily_info["leave_type"]
+                day_first_half_status = daily_info["first_half_status"]
+                day_second_half_status = daily_info["second_half_status"]
+                day_first_half_in_time = daily_info["first_half_in_time"]
+                day_first_half_out_time = daily_info["first_half_out_time"]
+                day_second_half_in_time = daily_info["second_half_in_time"]
+                day_second_half_out_time = daily_info["second_half_out_time"]
+                day_attendance_value = daily_info["attendance_value"]
                 if daily_info["status"] == "Absent":
-                    day_status = "Absent"
                     absent_reason = daily_info["absent_reason"]
-                elif daily_info["status"] == "Leave":
-                    day_status = "Leave"
             
             attendance_list.append({
                 "id": row[0],
@@ -16191,8 +17016,17 @@ async def get_personal_attendance_log(
                 "dept": row[3],
                 "timestamp": _ts(ts),
                 "status": day_status,
+                "punch_type": raw_punch_type,
                 "source": "face_scan",
                 "absent_reason": absent_reason,
+                "leave_type": day_leave_type,
+                "first_half_status": day_first_half_status,
+                "second_half_status": day_second_half_status,
+                "first_half_in_time": day_first_half_in_time,
+                "first_half_out_time": day_first_half_out_time,
+                "second_half_in_time": day_second_half_in_time,
+                "second_half_out_time": day_second_half_out_time,
+                "attendance_value": day_attendance_value,
             })
 
         # Add status-only records for dates without face scans
@@ -16212,7 +17046,15 @@ async def get_personal_attendance_log(
                         "source": "leave" if status == "Leave" else ("absent" if status == "Absent" else "od"),
                         "leave_type": leave_type,
                         "absent_reason": absent_reason,
+                        "first_half_status": daily_info["first_half_status"],
+                        "second_half_status": daily_info["second_half_status"],
+                        "first_half_in_time": daily_info["first_half_in_time"],
+                        "first_half_out_time": daily_info["first_half_out_time"],
+                        "second_half_in_time": daily_info["second_half_in_time"],
+                        "second_half_out_time": daily_info["second_half_out_time"],
+                        "attendance_value": daily_info["attendance_value"],
                     })
+
 
         attendance_list.sort(key=lambda x: x["timestamp"], reverse=True)
 
@@ -16402,9 +17244,23 @@ async def staff_get_attendance(
                     }
                 )
 
-        # Calculate stats (require check-out for scan-based days)
-        full_att_dates = _get_full_attendance_dates(reg_no, start_date, end_date)
-        present_days = len(full_att_dates | od_dates | earned_dates | casual_dates)
+        # Calculate present days (Half Day counts as 0.5, Present/OD counts as 1.0)
+        hd = _get_half_day_settings()
+        present_days = 0.0
+        if hd["half_day_enabled"]:
+            cursor.execute(
+                """
+                SELECT SUM(COALESCE(attendance_value, 0.0))
+                FROM daily_attendance_status
+                WHERE reg_no = %s AND date::date >= %s AND date::date <= %s
+                """,
+                (reg_no, start_date, end_date),
+            )
+            val_sum = cursor.fetchone()[0]
+            present_days = float(val_sum) if val_sum is not None else 0.0
+        else:
+            full_att_dates = _get_full_attendance_dates(reg_no, start_date, end_date)
+            present_days = float(len(full_att_dates | od_dates | earned_dates | casual_dates))
 
         if date:
             # Single day - only count if not in future
@@ -16630,7 +17486,7 @@ async def other_staff_dashboard(request: Request):
     # Get recent attendance (face scan + OD records)
     cursor.execute(
         """
-        SELECT id, reg_no, name, dept, role, timestamp, 'face_scan' as source
+        SELECT id, reg_no, name, dept, role, timestamp, 'face_scan' as source, status
         FROM other_staff_attendance 
         WHERE reg_no = %s 
         ORDER BY id DESC 
@@ -16664,7 +17520,7 @@ async def other_staff_dashboard(request: Request):
     # Build recent_attendance list with approval_date
     recent_attendance_list = []
     for row in recent_attendance:
-        if len(row) >= 8:
+        if len(row) >= 9: # Has status and leave_type
             # OD record with approval date
             recent_attendance_list.append(
                 {
@@ -16681,6 +17537,7 @@ async def other_staff_dashboard(request: Request):
             )
         else:
             # Face scan record
+            raw_status = row[7] if len(row) > 7 else None
             recent_attendance_list.append(
                 {
                     "id": row[0],
@@ -16694,7 +17551,9 @@ async def other_staff_dashboard(request: Request):
                     if len(row) > 5
                     else "",
                     "source": row[6] if len(row) > 6 else "face_scan",
-                    "leave_type": row[7] if len(row) > 7 else None,
+                    "status": _format_scan_status(raw_status, row[5]) if raw_status else "Present",
+                    "punch_type": raw_status or "check_in",
+                    "leave_type": None,
                 }
             )
 
@@ -16816,13 +17675,14 @@ async def other_staff_mark_attendance(request: Request):
         check_wifi(request)
 
     cursor.execute("""
-        SELECT slot_number, start_time, duration_minutes, is_enabled
+        SELECT slot_number, start_time, duration_minutes, is_enabled, slot_type, slot_half
         FROM attendance_duration_settings
         WHERE is_enabled = 1
         ORDER BY slot_number ASC
     """)
     duration_rows = cursor.fetchall()
 
+    active_slot_type = "check_in"
     if duration_rows:
         current_time = datetime.now()
         allowed = False
@@ -16831,21 +17691,26 @@ async def other_staff_mark_attendance(request: Request):
             slot_number = row[0]
             start_time = row[1]
             duration_minutes = row[2]
+            slot_type = row[4] if len(row) > 4 and row[4] else "check_in"
+            slot_half = row[5] if len(row) > 5 and row[5] else "full_day"
+            effective_duration, _, _ = _calculate_effective_slot_duration(slot_type, slot_half, duration_minutes)
 
             start_hour, start_minute = map(int, start_time.split(":"))
             start_datetime = current_time.replace(
                 hour=start_hour, minute=start_minute, second=0, microsecond=0
             )
-            end_datetime = start_datetime + timedelta(minutes=duration_minutes)
+            end_datetime = start_datetime + timedelta(minutes=effective_duration)
 
             if start_datetime <= current_time < end_datetime:
                 allowed = True
+                active_slot_type = slot_type
                 break
 
         if not allowed:
             ccl_slot_type = get_active_ccl_slot_type()
             if ccl_slot_type:
                 allowed = True
+                active_slot_type = ccl_slot_type
                 
         if not allowed:
             slots_info = ", ".join(
@@ -16862,10 +17727,28 @@ async def other_staff_mark_attendance(request: Request):
         
         if early_enabled or late_enabled:
             ccl_slot_type = get_active_ccl_slot_type()
-            if not ccl_slot_type:
+            if ccl_slot_type:
+                active_slot_type = ccl_slot_type
+            else:
                 raise HTTPException(
                     status_code=403,
                     detail="Attendance marking is not allowed at this time. (Outside CCL window)",
+                )
+
+    if active_slot_type == "check_out":
+        cursor.execute(
+            "SELECT COUNT(*) FROM other_staff_attendance WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = 'check_in'",
+            (staff_user["reg_no"],)
+        )
+        if cursor.fetchone()[0] == 0:
+            cursor.execute(
+                "SELECT COUNT(*) FROM attendance WHERE reg_no = ? AND DATE(timestamp) = CURRENT_DATE AND status = 'check_in'",
+                (staff_user["reg_no"],)
+            )
+            if cursor.fetchone()[0] == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="You cannot Check-Out without checking in first for today."
                 )
 
     # Parse request body for extra fields (lat/lng/location)
@@ -16882,8 +17765,8 @@ async def other_staff_mark_attendance(request: Request):
     try:
         cursor.execute(
             """
-            INSERT INTO other_staff_attendance (reg_no, name, dept, role, "timestamp")
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO other_staff_attendance (reg_no, name, dept, role, "timestamp", status)
+            VALUES (%s, %s, %s, %s, %s, %s)
         """,
             (
                 staff_user["reg_no"],
@@ -16891,6 +17774,7 @@ async def other_staff_mark_attendance(request: Request):
                 staff_user["dept"],
                 staff_user["role"],
                 timestamp,
+                active_slot_type,
             ),
         )
         conn.commit()

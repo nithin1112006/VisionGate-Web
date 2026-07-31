@@ -96,6 +96,44 @@ class LeaveRequestService {
     }
   }
 
+  /// Get all expired leaves list (supports optional regNo and dept filters)
+  static Future<Map<String, dynamic>> getExpiredLeaves(
+    String token, {
+    String? regNo,
+    String? dept,
+  }) async {
+    try {
+      final queryParams = <String, String>{};
+      if (regNo != null && regNo.isNotEmpty) queryParams['reg_no'] = regNo;
+      if (dept != null && dept.isNotEmpty && dept != 'All') queryParams['dept'] = dept;
+
+      final uri = Uri.parse('$API_URL/leave/expired').replace(queryParameters: queryParams.isNotEmpty ? queryParams : null);
+      final response = await http.get(
+        uri,
+        headers: {
+          'Authorization': 'Bearer $token',
+        },
+      );
+      
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body);
+      } else {
+        return {
+          'success': false,
+          'expired_leaves': [],
+          'message': 'Failed to fetch expired leaves',
+        };
+      }
+    } catch (e) {
+      return {
+        'success': false,
+        'expired_leaves': [],
+        'message': 'Network error: ${e.toString()}',
+      };
+    }
+  }
+
+
   /// Get details of a specific leave request
   static Future<Map<String, dynamic>> getLeaveRequestDetails(
     String token,

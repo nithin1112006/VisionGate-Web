@@ -189,7 +189,7 @@ class _FaceRegistrationWidgetState extends State<FaceRegistrationWidget> with Si
         setState(() {
           _isRegistering = false;
           _isRegistrationSuccess = true;
-          _statusMessage = "✅ ${json['message']}";
+          _statusMessage = "✅ ${(json is Map ? json['message'] : null) ?? 'Registration successful'}";
         });
         widget.onSuccess?.call();
         await Future.delayed(const Duration(seconds: 3));
@@ -200,7 +200,7 @@ class _FaceRegistrationWidgetState extends State<FaceRegistrationWidget> with Si
           _isRegistering = false;
           _isRegistrationError = true;
           _registrationErrorMessage =
-              errorJson['detail'] ?? 'Registration failed';
+              (errorJson is Map ? (errorJson['detail'] ?? errorJson['message'] ?? errorJson['error']) : null)?.toString() ?? 'Registration failed';
           _statusMessage = "❌ ${_registrationErrorMessage}";
         });
       }
@@ -995,7 +995,7 @@ class _FaceVerificationWidgetState extends State<FaceVerificationWidget> with Si
           _hasFace = true;
           _isVerified = true;
           _statusMessage =
-              "✅ ${json['message'] ?? 'Attendance marked successfully!'}";
+              "✅ ${(json is Map ? json['message'] : null) ?? 'Attendance marked successfully!'}";
         });
         widget.onVerified?.call();
         await Future.delayed(const Duration(seconds: 2));
@@ -1006,8 +1006,7 @@ class _FaceVerificationWidgetState extends State<FaceVerificationWidget> with Si
         try {
           final errorJson = jsonDecode(body);
           errorMsg =
-              errorJson['error'] ??
-              errorJson['detail'] ??
+              (errorJson is Map ? (errorJson['error'] ?? errorJson['detail'] ?? errorJson['message']) : null)?.toString() ??
               'Verification failed';
         } catch (e) {
           // If JSON parsing fails, use a generic message

@@ -943,7 +943,7 @@ class _AdminLeaveManagementState extends State<AdminLeaveManagement>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
+    _tabController = TabController(length: 3, vsync: this);
   }
 
   @override
@@ -967,6 +967,7 @@ class _AdminLeaveManagementState extends State<AdminLeaveManagement>
           tabs: const [
             Tab(text: 'All Requests'),
             Tab(text: 'Pending'),
+            Tab(text: 'Expired Leaves'),
           ],
         ),
         Expanded(
@@ -975,6 +976,7 @@ class _AdminLeaveManagementState extends State<AdminLeaveManagement>
             children: [
               AdminLeaveRequestList(token: widget.token),
               AdminPendingRequestList(token: widget.token),
+              ExpiredLeavesList(token: widget.token),
             ],
           ),
         ),
@@ -982,6 +984,7 @@ class _AdminLeaveManagementState extends State<AdminLeaveManagement>
     );
   }
 }
+
 
 /// Admin Leave Request List
 class AdminLeaveRequestList extends StatefulWidget {
@@ -2069,7 +2072,7 @@ class AdminNotificationsWidget extends StatefulWidget {
       _AdminNotificationsWidgetState();
 }
 
-/// Staff Leave Request Tab - shows form to submit and list of requests
+/// Staff Leave Request Tab - shows form to submit, my requests, and expired leaves list
 class StaffLeaveRequestTab extends StatefulWidget {
   final String token;
   final Color accentColor;
@@ -2091,7 +2094,7 @@ class _StaffLeaveRequestTabState extends State<StaffLeaveRequestTab>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
+    _tabController = TabController(length: 3, vsync: this);
   }
 
   @override
@@ -2106,11 +2109,12 @@ class _StaffLeaveRequestTabState extends State<StaffLeaveRequestTab>
       children: [
         TabBar(
           controller: _tabController,
-          labelColor: const Color(0xFF007AFF),
+          labelColor: widget.accentColor,
           unselectedLabelColor: Colors.grey,
           tabs: const [
             Tab(text: 'Submit Request'),
             Tab(text: 'My Requests'),
+            Tab(text: 'Expired Leaves'),
           ],
         ),
         Expanded(
@@ -2124,6 +2128,7 @@ class _StaffLeaveRequestTabState extends State<StaffLeaveRequestTab>
                 },
               ),
               LeaveRequestList(token: widget.token),
+              ExpiredLeavesList(token: widget.token),
             ],
           ),
         ),
@@ -2131,6 +2136,349 @@ class _StaffLeaveRequestTabState extends State<StaffLeaveRequestTab>
     );
   }
 }
+
+/// Expired Leaves List Widget - displays historical list of expired leaves with search & department filters
+class ExpiredLeavesList extends StatefulWidget {
+  final String token;
+
+  const ExpiredLeavesList({super.key, required this.token});
+
+  @override
+  State<ExpiredLeavesList> createState() => _ExpiredLeavesListState();
+}
+
+class _ExpiredLeavesListState extends State<ExpiredLeavesList> {
+  List<dynamic> _expiredLeaves = [];
+  bool _isLoading = true;
+  String? _error;
+  String _searchQuery = '';
+  String _selectedDept = 'All';
+  List<String> _departments = ['All'];
+
+  String _selectedLeaveType = 'All';
+  final List<String> _leaveTypeOptions = [
+    'All',
+    'Casual Leave (CL)',
+    'Earned Leave (EL)',
+    'Sick Leave',
+    'Other'
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadDepartments();
+    _loadExpiredLeaves();
+  }
+
+  Future<void> _loadDepartments() async {
+    try {
+      final res = await http.get(
+        Uri.parse('${CollegeIPConfig.defaultURL}/admin/departments'),
+        headers: {'Authorization': 'Bearer ${widget.token}'},
+      );
+      if (res.statusCode == 200) {
+        final data = json.decode(res.body);
+        if (data['success'] == true && data['departments'] != null) {
+          final depts = (data['departments'] as List).map((d) => d['name'].toString()).toList();
+          setState(() {
+            _departments = ['All', ...depts];
+          });
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _loadExpiredLeaves() async {
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+
+    final res = await LeaveRequestService.getExpiredLeaves(
+      widget.token,
+      dept: _selectedDept,
+    );
+
+    if (mounted) {
+      setState(() {
+        _isLoading = false;
+        if (res['success'] == true) {
+          _expiredLeaves = res['expired_leaves'] ?? [];
+        } else {
+          _error = res['message'] ?? 'Failed to load expired leaves';
+        }
+      });
+    }
+  }
+
+  List<dynamic> get _filteredLeaves {
+    return _expiredLeaves.where((item) {
+      final leaveType = (item['leave_type'] ?? '').toString();
+      
+      // Filter by Leave Type
+      if (_selectedLeaveType != 'All') {
+        if (_selectedLeaveType == 'Casual Leave (CL)' && !leaveType.contains('Casual')) return false;
+        if (_selectedLeaveType == 'Earned Leave (EL)' && !leaveType.contains('Earned') && !leaveType.contains('CCL')) return false;
+        if (_selectedLeaveType == 'Sick Leave' && !leaveType.contains('Sick')) return false;
+        if (_selectedLeaveType == 'Other' && (leaveType.contains('Casual') || leaveType.contains('Earned') || leaveType.contains('CCL') || leaveType.contains('Sick'))) return false;
+      }
+
+      // Filter by Search Query
+      if (_searchQuery.trim().isNotEmpty) {
+        final query = _searchQuery.toLowerCase().trim();
+        final name = (item['user_name'] ?? '').toString().toLowerCase();
+        final regNo = (item['reg_no'] ?? '').toString().toLowerCase();
+        final lType = leaveType.toLowerCase();
+        final dept = (item['dept'] ?? '').toString().toLowerCase();
+        return name.contains(query) || regNo.contains(query) || lType.contains(query) || dept.contains(query);
+      }
+      return true;
+    }).toList();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final displayedList = _filteredLeaves;
+
+    return Column(
+      children: [
+        // Filter Header Bar
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: isDark ? const Color(0xFF1E1E1E) : Colors.grey.shade100,
+            border: Border(bottom: BorderSide(color: isDark ? Colors.white12 : Colors.grey.shade300)),
+          ),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  // Search Input
+                  Expanded(
+                    child: TextField(
+                      onChanged: (val) => setState(() => _searchQuery = val),
+                      decoration: InputDecoration(
+                        hintText: 'Search staff name, reg no...',
+                        prefixIcon: const Icon(Icons.search, size: 20),
+                        isDense: true,
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        filled: true,
+                        fillColor: isDark ? const Color(0xFF2C2C2C) : Colors.white,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  // Department Dropdown Filter
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    decoration: BoxDecoration(
+                      color: isDark ? const Color(0xFF2C2C2C) : Colors.white,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<String>(
+                        value: _departments.contains(_selectedDept) ? _selectedDept : 'All',
+                        icon: const Icon(Icons.filter_list, size: 18),
+                        onChanged: (newDept) {
+                          if (newDept != null) {
+                            setState(() => _selectedDept = newDept);
+                            _loadExpiredLeaves();
+                          }
+                        },
+                        items: _departments.map((dept) {
+                          return DropdownMenuItem<String>(
+                            value: dept,
+                            child: Text(
+                              dept == 'All' ? 'All Depts' : dept,
+                              style: const TextStyle(fontSize: 13),
+                            ),
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  const Icon(Icons.category_outlined, size: 16, color: Colors.grey),
+                  const SizedBox(width: 6),
+                  const Text('Leave Type: ', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500)),
+                  Expanded(
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        children: _leaveTypeOptions.map((type) {
+                          final isSelected = _selectedLeaveType == type;
+                          return Padding(
+                            padding: const EdgeInsets.only(right: 6),
+                            child: FilterChip(
+                              selected: isSelected,
+                              label: Text(type, style: TextStyle(fontSize: 11, color: isSelected ? Colors.white : (isDark ? Colors.white70 : Colors.black87))),
+                              selectedColor: const Color(0xFF007AFF),
+                              backgroundColor: isDark ? const Color(0xFF2C2C2C) : Colors.grey.shade200,
+                              onSelected: (selected) {
+                                setState(() {
+                                  _selectedLeaveType = type;
+                                });
+                              },
+                            ),
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+
+
+        // Body List / Loader / Empty State
+        Expanded(
+          child: _isLoading
+              ? const Center(child: CircularProgressIndicator(color: Color(0xFF007AFF)))
+              : _error != null
+                  ? Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Text(_error!, style: const TextStyle(color: Colors.red)),
+                          const SizedBox(height: 8),
+                          ElevatedButton(
+                            onPressed: _loadExpiredLeaves,
+                            child: const Text('Retry'),
+                          ),
+                        ],
+                      ),
+                    )
+                  : displayedList.isEmpty
+                      ? Center(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(Icons.history_toggle_off_rounded, size: 64, color: isDark ? Colors.white30 : Colors.grey[400]),
+                              const SizedBox(height: 16),
+                              Text(
+                                'No expired leaves found',
+                                style: TextStyle(fontSize: 16, color: isDark ? Colors.white60 : Colors.grey[600]),
+                              ),
+                            ],
+                          ),
+                        )
+                      : RefreshIndicator(
+                          onRefresh: _loadExpiredLeaves,
+                          color: const Color(0xFF007AFF),
+                          child: ListView.builder(
+                            padding: const EdgeInsets.all(16),
+                            itemCount: displayedList.length,
+                            itemBuilder: (context, index) {
+                              final item = displayedList[index];
+                              final leaveType = item['leave_type'] ?? 'Leave';
+                              final amount = item['expired_amount'] ?? 0.0;
+                              final date = item['expiry_date'] ?? '';
+                              final reason = item['reason'] ?? 'Expired';
+                              final userName = item['user_name'] ?? '';
+                              final regNo = item['reg_no'] ?? '';
+                              final dept = item['dept'] ?? '';
+
+                              return Card(
+                                margin: const EdgeInsets.only(bottom: 12),
+                                elevation: 2,
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(16),
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Row(
+                                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                        children: [
+                                          Row(
+                                            children: [
+                                              Container(
+                                                padding: const EdgeInsets.all(8),
+                                                decoration: BoxDecoration(
+                                                  color: Colors.red.withValues(alpha: 0.1),
+                                                  borderRadius: BorderRadius.circular(8),
+                                                ),
+                                                child: const Icon(Icons.timer_off_rounded, color: Colors.red, size: 20),
+                                              ),
+                                              const SizedBox(width: 12),
+                                              Column(
+                                                crossAxisAlignment: CrossAxisAlignment.start,
+                                                children: [
+                                                  Text(
+                                                    leaveType,
+                                                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                                                  ),
+                                                  if (userName.isNotEmpty)
+                                                    Text(
+                                                      '$userName ($regNo • $dept)',
+                                                      style: TextStyle(fontSize: 12, color: isDark ? Colors.white60 : Colors.grey[600]),
+                                                    ),
+                                                ],
+                                              ),
+                                            ],
+                                          ),
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                            decoration: BoxDecoration(
+                                              color: Colors.red.shade50,
+                                              borderRadius: BorderRadius.circular(20),
+                                              border: Border.all(color: Colors.red.shade200),
+                                            ),
+                                            child: Text(
+                                              '-$amount Days',
+                                              style: TextStyle(color: Colors.red.shade700, fontWeight: FontWeight.bold, fontSize: 12),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 12),
+                                      const Divider(height: 1),
+                                      const SizedBox(height: 8),
+                                      Row(
+                                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                        children: [
+                                          Row(
+                                            children: [
+                                              Icon(Icons.event_outlined, size: 14, color: isDark ? Colors.white54 : Colors.grey[600]),
+                                              const SizedBox(width: 4),
+                                              Text(
+                                                'Expiry Date: $date',
+                                                style: TextStyle(fontSize: 12, color: isDark ? Colors.white70 : Colors.grey[700]),
+                                              ),
+                                            ],
+                                          ),
+                                          Text(
+                                            reason,
+                                            style: TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: isDark ? Colors.white54 : Colors.grey[600]),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+        ),
+      ],
+    );
+  }
+}
+
+
 
 class _AdminNotificationsWidgetState extends State<AdminNotificationsWidget> {
   List<dynamic> _notifications = [];

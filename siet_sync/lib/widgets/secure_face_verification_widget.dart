@@ -198,7 +198,7 @@ class _SecureFaceVerificationWidgetState
     }
   }
 
-  void _handleVerificationSuccess(Map<String, dynamic> result) {
+  void _handleVerificationSuccess(Map<String, dynamic>? result) {
     _failedAttempts = 0;
     widget.onVerificationSuccess();
     LeaveBalanceNotifier.instance.notifyBalanceChanged();
@@ -211,11 +211,11 @@ class _SecureFaceVerificationWidgetState
           children: [
             const Icon(Icons.check_circle, color: Colors.white, size: 48),
             const SizedBox(height: 8),
-            Text(result['message'] ??
+            Text((result != null ? result['message'] : null) ??
                 (widget.isSettingsAuth
                     ? 'Identity verified successfully'
                     : 'Attendance marked successfully')),
-            if (result['data']?['confidence'] != null)
+            if (result != null && result['data']?['confidence'] != null)
               Text(
                 'Confidence: ${(result['data']['confidence'] * 100).toStringAsFixed(1)}%',
                 style: const TextStyle(fontSize: 12),

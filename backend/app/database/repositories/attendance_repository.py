@@ -313,3 +313,85 @@ class AttendanceRepository(BaseRepository):
                     )
                     ids.append(row["id"])
         return ids
+
+    async def update_attendance_value(
+        self,
+        reg_no: str,
+        for_date: date,
+        attendance_value: Decimal
+    ) -> bool:
+        """Update attendance value for a specific user and date.
+        
+        Args:
+            reg_no: Registration number
+            for_date: Date to update
+            attendance_value: New attendance value (0.0, 0.5, or 1.0)
+            
+        Returns:
+            True if update successful, False otherwise
+        """
+        result = await self.execute(
+            """
+            UPDATE daily_attendance_status
+            SET attendance_value = $3, updated_at = NOW()
+            WHERE reg_no = $1 AND date = $2
+            """,
+            reg_no, for_date, attendance_value
+        )
+        return result is not None
+
+    async def get_attendance_value_sum(
+        self,
+        reg_no: str,
+        start_date: date,
+        end_date: date
+    ) -> Decimal:
+        """Get sum of attendance values for a user over a date range.
+        
+        Args:
+            reg_no: Registration number
+            start_date: Start date (inclusive)
+            end_date: End date (inclusive)
+            
+        Returns:
+            Sum of attendance values as Decimal
+        """
+        row = await self.fetchrow(
+            """
+            SELECT COALESCE(SUM(attendance_value), 0) as total_value
+            FROM daily_attendance_status
+            WHERE reg_no = $1 AND date >= $2 AND date <= $3
+            """,
+            reg_no, start_date, end_date
+        )
+        return row["total_value"] if row else Decimal("0.0")
+
+    async def recalculate_attendance_values(self, reg_no: str, for_date: date) -> bool:
+        """Recalculate attendance value based on half-day statuses.
+        
+        Args:
+            reg_no: Registration number
+            for_date: Date to recalculate
+            
+        Returns:
+            True if recalculation successful, False otherwise
+        """
+        row = await self.fetchrow(
+            """
+            UPDATE daily_attendance_status
+            SET attendance_value = 
+                CASE 
+                    WHEN COALESCE(first_half_status, 'Absent') = 'Present' 
+                     AND COALESCE(second_half_status, 'Absent') = 'Present' THEN 1.0
+                    WHEN COALESCE(first_half_status, 'Absent') = 'Present' 
+                      OR COALESCE(second_half_status, 'Absent') = 'Present' THEN 0.5
+                    WHEN status = 'Holiday' THEN 1.0
+                    ELSE 0.0
+                END,
+                updated_at = NOW()
+            WHERE reg_no = $1 AND date = $2
+            RETURNING attendance_value
+            """,
+            reg_no, for_date
+        )
+        return row is not None

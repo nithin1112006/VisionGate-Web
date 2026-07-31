@@ -6368,13 +6368,27 @@ class _DashboardTabState extends State<DashboardTab> {
   String _formatTimestamp(dynamic raw) {
     final ts = raw?.toString().trim() ?? '';
     if (ts.isEmpty) return '';
+    
+    DateTime? dt;
+    if (ts.contains('T')) {
+      dt = DateTime.tryParse(ts);
+    } else {
+      dt = DateTime.tryParse(ts.replaceAll(' ', 'T'));
+    }
+
+    String formatted = ts;
     if (ts.contains('T')) {
       final parts = ts.split('T');
       final date = parts[0];
       final time = parts[1].split('.').first;
-      return '$date $time';
+      formatted = '$date $time';
     }
-    return ts;
+
+    if (dt != null) {
+      final session = dt.hour < 13 ? 'FN' : 'AN';
+      return '0.5 $session • $formatted';
+    }
+    return formatted;
   }
 
   @override
@@ -6759,8 +6773,25 @@ class _DashboardTabState extends State<DashboardTab> {
                           final avatarIconSize = isSmallScreen ? 14.0 : 18.0;
                           final titleSize = isSmallScreen ? 13.0 : 14.0;
                           final subtitleSize = isSmallScreen ? 11.0 : 12.0;
-                          final trailingSize = isSmallScreen ? 10.0 : 12.0;
+                          final trailingSize = isSmallScreen ? 9.0 : 10.0;
                           final isAbsent = record['status'] == 'Absent';
+                          final punchType = record['punch_type'] as String? ?? 'check_in';
+                          final isCheckOut = punchType == 'check_out';
+                          final punchColor = isAbsent
+                              ? Colors.red
+                              : isCheckOut
+                                  ? Colors.orange
+                                  : Colors.green;
+                          final punchLabel = isAbsent
+                              ? 'Absent'
+                              : isCheckOut
+                                  ? 'Check Out'
+                                  : 'Check In';
+                          final punchIcon = isAbsent
+                              ? Icons.cancel
+                              : isCheckOut
+                                  ? Icons.logout
+                                  : Icons.login;
                           return ListTile(
                             contentPadding: EdgeInsets.symmetric(
                               horizontal: isSmallScreen ? 8.0 : 12.0,
@@ -6768,37 +6799,17 @@ class _DashboardTabState extends State<DashboardTab> {
                             ),
                             leading: CircleAvatar(
                               radius: avatarRadius,
-                              backgroundColor: isAbsent 
-                                  ? Colors.red.withValues(alpha: 0.1)
-                                  : adminAccent.withValues(alpha: 0.1),
+                              backgroundColor: punchColor.withValues(alpha: 0.12),
                               child: Icon(
-                                isAbsent ? Icons.cancel : Icons.person,
+                                punchIcon,
                                 size: avatarIconSize,
-                                color: isAbsent ? Colors.red : adminAccent,
+                                color: punchColor,
                               ),
                             ),
-                            title: Row(
-                              children: [
-                                Expanded(
-                                  child: Text(
-                                    record['name'] ?? 'Unknown',
-                                    style: TextStyle(fontSize: titleSize),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                                if (isAbsent)
-                                  Container(
-                                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                    decoration: BoxDecoration(
-                                      color: Colors.red.withValues(alpha: 0.1),
-                                      borderRadius: BorderRadius.circular(4),
-                                    ),
-                                    child: const Text(
-                                      'Absent',
-                                      style: TextStyle(color: Colors.red, fontSize: 10, fontWeight: FontWeight.bold),
-                                    ),
-                                  ),
-                              ],
+                            title: Text(
+                              record['name'] ?? 'Unknown',
+                              style: TextStyle(fontSize: titleSize),
+                              overflow: TextOverflow.ellipsis,
                             ),
                             subtitle: Text(
                               isAbsent
@@ -6808,12 +6819,39 @@ class _DashboardTabState extends State<DashboardTab> {
                               overflow: TextOverflow.ellipsis,
                               maxLines: isAbsent ? 2 : 1,
                             ),
-                            trailing: Text(
-                              when,
-                              style: TextStyle(
-                                color: Colors.grey[600],
-                                fontSize: trailingSize,
-                              ),
+                            trailing: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: punchColor.withValues(alpha: isDark ? 0.22 : 0.10),
+                                    borderRadius: BorderRadius.circular(5),
+                                    border: Border.all(
+                                      color: punchColor.withValues(alpha: 0.35),
+                                      width: 0.8,
+                                    ),
+                                  ),
+                                  child: Text(
+                                    punchLabel,
+                                    style: TextStyle(
+                                      color: punchColor,
+                                      fontSize: trailingSize,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  when,
+                                  style: TextStyle(
+                                    color: Colors.grey[600],
+                                    fontSize: trailingSize,
+                                  ),
+                                ),
+                              ],
                             ),
                           );
                         },
@@ -7184,16 +7222,17 @@ class _ErrorLogsDialogState extends State<_ErrorLogsDialog> {
                 itemCount: logs.length,
                 itemBuilder: (context, index) {
                   final log = logs[index];
+                  final isMap = log is Map;
                   return ListTile(
                     leading: Icon(
-                      log['type'] == 'attendance_error'
+                      (isMap ? log['type'] : null) == 'attendance_error'
                           ? Icons.person_off
                           : Icons.login,
                       color: Colors.red[400],
                     ),
-                    title: Text(log['message'] ?? 'Unknown error'),
+                    title: Text((isMap ? log['message'] : null) ?? 'Unknown error'),
                     subtitle: Text(
-                      '${log['timestamp'] ?? ''} - ${log['type'] ?? ''}',
+                      '${(isMap ? log['timestamp'] : null) ?? ''} - ${(isMap ? log['type'] : null) ?? ''}',
                       style: TextStyle(fontSize: 12, color: Colors.grey[600]),
                     ),
                   );
