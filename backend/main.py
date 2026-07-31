@@ -2029,13 +2029,13 @@ async def save_attendance_duration_settings(request: Request):
                 raise HTTPException(status_code=400, detail=err_msg)
 
 
-    # Validate slot durations (Max 360 mins / 6 hours)
+    # Validate slot durations (Max 120 mins)
     for setting in settings:
         dur = int(setting.get("duration_minutes", 30))
-        if dur > 360:
+        if dur > 120:
             raise HTTPException(
                 status_code=400,
-                detail=f"Slot {setting.get('slot_number')} duration ({dur} mins) exceeds maximum limit of 360 minutes (6 hours)."
+                detail=f"Slot {setting.get('slot_number')} duration ({dur} mins) exceeds maximum limit of 120 minutes."
             )
         if dur <= 0:
             raise HTTPException(
@@ -2044,9 +2044,8 @@ async def save_attendance_duration_settings(request: Request):
             )
 
     # Validate auto extension durations (Max 60 mins) if provided
-    body = await request.json() if request.headers.get("content-type") == "application/json" else {}
-    if "auto_expansion" in body:
-        auto_exp = body["auto_expansion"]
+    if "auto_expansion" in data:
+        auto_exp = data["auto_expansion"]
         fn_ext = int(auto_exp.get("auto_expand_fn_minutes", 5))
         an_ext = int(auto_exp.get("auto_expand_an_minutes", 5))
         def_ext = int(auto_exp.get("auto_expand_minutes", 5))
@@ -2111,9 +2110,8 @@ async def save_attendance_duration_settings(request: Request):
         conn.commit()
 
         # Save auto expansion settings if provided
-        body = await request.json() if request.headers.get("content-type") == "application/json" else {}
-        if "auto_expansion" in body:
-            auto_exp = body["auto_expansion"]
+        if "auto_expansion" in data:
+            auto_exp = data["auto_expansion"]
             if "auto_expand_checkin_enabled" in auto_exp:
                 val = "true" if auto_exp["auto_expand_checkin_enabled"] else "false"
                 _save_leave_setting("auto_expand_checkin_enabled", val, admin_user["name"])

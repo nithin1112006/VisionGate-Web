@@ -68134,7 +68134,7 @@ s=1
 break}}for(f=0;g=m.d,f<g.length;++f){e=J.h(g[f],"duration_minutes")
 if(e==null||J.bAF(e,0)){m.AT("Slot "+(f+1)+" duration must be greater than 0 minutes.")
 s=1
-break A}if(J.bp3(e,360)){m.AT("Slot "+(f+1)+" duration cannot exceed 360 minutes (6 hours). Current value: "+A.i(e)+" mins.")
+break A}if(J.bp3(e,120)){m.AT("Slot "+(f+1)+" duration cannot exceed 120 minutes (2 hours). Current value: "+A.i(e)+" mins.")
 s=1
 break A}}m.p(new A.aNb(m))
 p=4
