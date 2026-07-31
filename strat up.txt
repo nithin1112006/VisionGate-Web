@@ -1,1 +1,12 @@
- 
+cd /var/www/attenda/backend
+source .venv/bin/activate
+python -m uvicorn main:app --host 0.0.0.0 --port 8001
+
+cd /var/www/attenda
+cloudflared tunnel --url http://localhost:8001
+
+cloudflared tunnel run attenda-tunnel
+
+sudo systemctl start postgresql
+# or
+sudo service postgresql start
