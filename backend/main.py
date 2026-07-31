@@ -2029,13 +2029,13 @@ async def save_attendance_duration_settings(request: Request):
                 raise HTTPException(status_code=400, detail=err_msg)
 
 
-    # Validate slot durations (Max 120 mins)
+    # Validate slot durations (Max 360 mins / 6 hours)
     for setting in settings:
         dur = int(setting.get("duration_minutes", 30))
-        if dur > 120:
+        if dur > 360:
             raise HTTPException(
                 status_code=400,
-                detail=f"Slot {setting.get('slot_number')} duration ({dur} mins) exceeds maximum limit of 120 minutes."
+                detail=f"Slot {setting.get('slot_number')} duration ({dur} mins) exceeds maximum limit of 360 minutes (6 hours)."
             )
         if dur <= 0:
             raise HTTPException(

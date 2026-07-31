@@ -113,15 +113,15 @@ class _AttendanceDurationSettingsState extends State<AttendanceDurationSettings>
       }
     }
 
-    // Validate Normal Slot Durations (Max 120 mins, Min 1 min)
+    // Validate Normal Slot Durations (Max 360 mins, Min 1 min)
     for (int i = 0; i < _slots.length; i++) {
       final dur = _slots[i]['duration_minutes'];
       if (dur == null || dur <= 0) {
         _showConflictDialog('Slot ${i + 1} duration must be greater than 0 minutes.');
         return;
       }
-      if (dur > 120) {
-        _showConflictDialog('Slot ${i + 1} duration cannot exceed 120 minutes (2 hours). Current value: $dur mins.');
+      if (dur > 360) {
+        _showConflictDialog('Slot ${i + 1} duration cannot exceed 360 minutes (6 hours). Current value: $dur mins.');
         return;
       }
     }
